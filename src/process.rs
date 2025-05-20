@@ -1,9 +1,7 @@
 #![allow(nonstandard_style)]
 use std::{
     borrow::Cow,
-    cell::UnsafeCell,
-    ffi::{CStr, OsStr},
-    marker::PhantomData,
+    ffi::CStr,
     mem,
     ops::{BitAnd, BitOr},
     os::windows::raw::HANDLE,
@@ -13,16 +11,38 @@ use std::{
 
 use windows_sys::{
     Win32::{
-        Foundation::{ERROR_ACCESS_DENIED, FALSE, GetLastError, INVALID_HANDLE_VALUE, LocalFree},
+        Foundation::{
+            BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FALSE,
+            GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
+            WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         Globalization::GetSystemDefaultLangID,
         Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{
+            CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        },
         System::{
+            Com::CoTaskMemFree,
             Diagnostics::Debug::{
                 FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
-                FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageA,
+                FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageA, MINIDUMP_TYPE,
+                MiniDumpIgnoreInaccessibleMemory, MiniDumpWithFullMemory, MiniDumpWriteDump,
+                SymGetOptions, SymSetOptions,
             },
-            Threading::{GetCurrentProcess, PROCESS_INFORMATION, STARTUPINFOW},
+            Environment::GetEnvironmentVariableW,
+            ProcessStatus::GetModuleBaseNameW,
+            Registry::{
+                HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RRF_RT_ANY, RegCloseKey, RegGetValueW,
+                RegOpenKeyExW,
+            },
+            Threading::{
+                GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcess,
+                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+                WaitForSingleObject,
+            },
         },
+        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
     },
     w,
 };
@@ -334,6 +354,11 @@ impl uv_process {
 enum Error {
     ENOTSUP,
     EINVAL,
+    ENOMEM,
+    ESRCH,
+    ENOSYS,
+    EACCES,
+    UNKNOWN,
 }
 
 impl BitOr for uv_process_flags {
@@ -525,6 +550,278 @@ fn search_path_walk_ext(dir: &[u16], name: &[u16], ext: &[u16], cwd: &[u16]) -> 
     None
 }
 
+/// Compares two environment variable strings, just comparing the part before the = sign.
+///
+/// This is case-insensitive as Windows environment variables are case-insensitive.
+/// If `na` is negative, this function will find the equals sign in string `a`.
+/// Otherwise, it will use `na-1` as the length to compare.
+///
+/// Returns negative if a < b, positive if a > b, 0 if they are equal.
+///
+/// This is a Rust translation of the original env_strncmp C function.
+fn env_strncmp(a: &[u16], na: isize, b: &[u16]) -> i32 {
+    use windows_sys::Win32::Globalization::CSTR_EQUAL;
+    use windows_sys::Win32::Globalization::CompareStringOrdinal;
+
+    let na = if na < 0 {
+        // Find the equals sign to determine variable name length
+        let mut a_eq = None;
+        for (i, &c) in a.iter().enumerate() {
+            if c == wchar!('=') {
+                a_eq = Some(i);
+                break;
+            }
+        }
+        assert!(a_eq.is_some());
+        a_eq.unwrap()
+    } else {
+        // na is already the correct length minus 1
+        (na - 1) as usize
+    };
+
+    // Find equals sign in b
+    let mut b_eq = None;
+    for (i, &c) in b.iter().enumerate() {
+        if c == wchar!('=') {
+            b_eq = Some(i);
+            break;
+        }
+    }
+    assert!(b_eq.is_some());
+    let nb = b_eq.unwrap();
+
+    // Compare the strings case-insensitively
+    let r = unsafe {
+        CompareStringOrdinal(
+            a.as_ptr(),
+            na as i32,
+            b.as_ptr(),
+            nb as i32,
+            true as i32, // Case insensitive
+        )
+    };
+
+    // Subtract CSTR_EQUAL to get the comparison result
+    r - CSTR_EQUAL
+}
+
+/// Comparison function for sorting environment variables
+///
+/// This passes a -1 for `na` to env_strncmp, which will make it find the equals sign
+/// in the first string.
+///
+/// This is a Rust translation of the original qsort_wcscmp C function.
+fn qsort_wcscmp(a: &[u16], b: &[u16]) -> i32 {
+    env_strncmp(a, -1, b)
+}
+
+/// Helper function to find PATH environment variable in the environment block
+///
+/// The environment block is a series of null-terminated strings, with an
+/// additional null character at the end. This function traverses the block
+/// looking for the PATH entry and returns the value portion (after the equals sign).
+///
+/// Returns None if no PATH is found.
+///
+/// This is a Rust translation of the original find_path C function.
+fn find_path(env: &[u16]) -> Option<&[u16]> {
+    let mut current = 0;
+
+    while current < env.len() && env[current] != 0 {
+        // Find length of current environment string
+        let mut len = 0;
+        while current + len < env.len() && env[current + len] != 0 {
+            len += 1;
+        }
+
+        // Check if it's the PATH variable (case-insensitive)
+        if len > 5
+            && (env[current] == wchar!('P') || env[current] == wchar!('p'))
+            && (env[current + 1] == wchar!('A') || env[current + 1] == wchar!('a'))
+            && (env[current + 2] == wchar!('T') || env[current + 2] == wchar!('t'))
+            && (env[current + 3] == wchar!('H') || env[current + 3] == wchar!('h'))
+            && (env[current + 4] == wchar!('='))
+        {
+            // Return the value part (after '=')
+            return Some(&env[current + 5..current + len]);
+        }
+
+        // Move to next environment string
+        current += len + 1;
+    }
+
+    None
+}
+
+/// Create Windows environment block from environment variables
+///
+/// The way Windows takes environment variables is different than what C does;
+/// Windows wants a contiguous block of null-terminated strings, terminated
+/// with an additional null.
+///
+/// Windows has a few "essential" environment variables. winsock will fail
+/// to initialize if SYSTEMROOT is not defined; some APIs make reference to
+/// TEMP. SYSTEMDRIVE is probably also important. We therefore ensure that
+/// these get defined if the input environment block does not contain any
+/// values for them.
+///
+/// Also add variables known to Cygwin to be required for correct
+/// subprocess operation in many cases.
+///
+/// This is a Rust translation of the original make_program_env function.
+fn make_program_env(env_block: Option<&[&str]>) -> Result<WCString, Error> {
+    // If env_block is None, we'll just generate the environment with required variables
+    let env_block = env_block.unwrap_or(&[]);
+    let mut env_len = 0;
+    let mut env_block_count = 1; // 1 for null terminator
+
+    // First pass: determine size in UTF-16
+    let mut env_copy = Vec::new();
+    for env in env_block {
+        if env.contains('=') {
+            // Convert to UTF-16 and add to our collection
+            let mut utf16 = env.encode_utf16().collect::<Vec<u16>>();
+            utf16.push(0); // Null terminate
+            env_len += utf16.len();
+            env_block_count += 1;
+            env_copy.push(utf16);
+        }
+    }
+
+    // Sort the environment variables
+    env_copy.sort_by(|a, b| {
+        let cmp = qsort_wcscmp(a, b);
+        cmp.cmp(&0)
+    });
+
+    // Third pass: check for required variables
+    let mut required_vars_value_len = Vec::with_capacity(REQUIRED_VARS.len());
+    let mut required_present = vec![false; REQUIRED_VARS.len()];
+
+    for i in 0..REQUIRED_VARS.len() {
+        let mut found = false;
+        for env in &env_copy {
+            // Get a slice of wide_eq without null terminator
+            let wide_eq = REQUIRED_VARS[i].wide_eq;
+            let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
+
+            if env_strncmp(wide_eq_slice, REQUIRED_VARS[i].len as isize, env) == 0 {
+                found = true;
+                required_present[i] = true;
+                break;
+            }
+        }
+
+        if !found {
+            // Missing required var - check if it's available in the system
+            let var_size =
+                unsafe { GetEnvironmentVariableW(REQUIRED_VARS[i].wide, std::ptr::null_mut(), 0) };
+
+            required_vars_value_len.push(var_size as usize);
+
+            if var_size != 0 {
+                env_len += REQUIRED_VARS[i].len as usize;
+                env_len += var_size as usize;
+            }
+        } else {
+            required_vars_value_len.push(0);
+        }
+    }
+
+    // Final pass: copy in sort order, inserting required variables
+    let mut result = Vec::with_capacity(env_len + 1);
+
+    // A helper to merge the sorted env_copy with required variables
+    let mut env_index = 0;
+    let mut req_index = 0;
+
+    while env_index < env_copy.len() || req_index < REQUIRED_VARS.len() {
+        if req_index >= REQUIRED_VARS.len() {
+            // No more required vars, just copy remaining environment vars
+            result.extend_from_slice(&env_copy[env_index][..]);
+            env_index += 1;
+        } else if env_index >= env_copy.len() {
+            // No more environment vars, check if we need to add this required var
+            if !required_present[req_index] && required_vars_value_len[req_index] > 0 {
+                // Add this required var
+                let var = &REQUIRED_VARS[req_index];
+
+                // Get wide_eq as a slice without null terminator
+                let wide_eq = var.wide_eq;
+                let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
+                result.extend_from_slice(wide_eq_slice);
+
+                // Get the value
+                let mut buffer = vec![0u16; required_vars_value_len[req_index]];
+                let var_size = unsafe {
+                    GetEnvironmentVariableW(var.wide, buffer.as_mut_ptr(), buffer.len() as u32)
+                };
+
+                if var_size as usize != required_vars_value_len[req_index] - 1 {
+                    uv_fatal_error("GetEnvironmentVariableW");
+                }
+
+                result.extend_from_slice(&buffer[..var_size as usize]);
+                result.push(0); // Null terminate
+            }
+            req_index += 1;
+        } else {
+            // Compare current environment var with current required var
+            // Get wide_eq as a slice without null terminator
+            let wide_eq = REQUIRED_VARS[req_index].wide_eq;
+            let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
+
+            let cmp = env_strncmp(
+                wide_eq_slice,
+                REQUIRED_VARS[req_index].len as isize,
+                &env_copy[env_index],
+            );
+
+            if cmp < 0 {
+                // Required var comes first alphabetically
+                if !required_present[req_index] && required_vars_value_len[req_index] > 0 {
+                    // Add this required var
+                    let var = &REQUIRED_VARS[req_index];
+
+                    // Get wide_eq as a slice without null terminator
+                    let wide_eq = var.wide_eq;
+                    let wide_eq_slice =
+                        unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
+                    result.extend_from_slice(wide_eq_slice);
+
+                    // Get the value
+                    let mut buffer = vec![0u16; required_vars_value_len[req_index]];
+                    let var_size = unsafe {
+                        GetEnvironmentVariableW(var.wide, buffer.as_mut_ptr(), buffer.len() as u32)
+                    };
+
+                    if var_size as usize != required_vars_value_len[req_index] - 1 {
+                        uv_fatal_error("GetEnvironmentVariableW");
+                    }
+
+                    result.extend_from_slice(&buffer[..var_size as usize]);
+                    result.push(0); // Null terminate
+                }
+                req_index += 1;
+            } else {
+                // Environment var comes first or they are equal
+                result.extend_from_slice(&env_copy[env_index][..]);
+                env_index += 1;
+
+                if cmp == 0 {
+                    // They are equal, so we've included the required var already
+                    req_index += 1;
+                }
+            }
+        }
+    }
+
+    // Terminate with an extra NULL
+    result.push(0);
+
+    Ok(WCString::from_vec(result))
+}
+
 fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> Option<WCString> {
     // If the caller supplies an empty filename,
     // we're not gonna return c:\windows\.exe -- GFY!
@@ -634,4 +931,356 @@ fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> O
     }
 
     None
+}
+
+// Define signal values matching the ones in libuv
+const SIGKILL: i32 = 9;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIGQUIT: i32 = 3;
+
+// Define total number of signals
+const NSIG: i32 = 32;
+
+// Define the dump options constant missing in the Windows crate
+const AVX_XSTATE_CONTEXT: MINIDUMP_TYPE = 0x00200000;
+
+/// Kill a process identified by process handle with a specific signal
+///
+/// Returns 0 on success, or a negative error code.
+fn uv__kill(process_handle: HANDLE, signum: i32) -> i32 {
+    // Validate signal number
+    if signum < 0 || signum >= NSIG {
+        return Error::EINVAL as i32;
+    }
+
+    // Create a dump file for SIGQUIT
+    if signum == SIGQUIT {
+        unsafe {
+            // Local variables
+            let mut registry_key = 0;
+            let pid = GetProcessId(process_handle);
+            let mut basename_buf = [0u16; 260]; // MAX_PATH
+
+            // Get target process name
+            GetModuleBaseNameW(
+                process_handle,
+                ptr::null_mut(), // No module handle, want process name
+                basename_buf.as_mut_ptr(),
+                basename_buf.len() as u32,
+            );
+
+            // Get LocalDumps directory path
+            let registry_result = RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                w!("SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps"),
+                0,
+                KEY_QUERY_VALUE,
+                &mut registry_key as *mut _ as *mut HKEY,
+            );
+
+            if registry_result == ERROR_SUCCESS {
+                let mut dump_folder = [0u16; 260]; // MAX_PATH
+                let mut dump_name = [0u16; 260]; // MAX_PATH
+                let mut dump_folder_len = dump_folder.len() as u32 * 2; // Size in bytes
+                let mut key_type = 0;
+
+                // Try to get DumpFolder from registry
+                let ret = RegGetValueW(
+                    registry_key as HKEY,
+                    ptr::null(),
+                    w!("DumpFolder"),
+                    RRF_RT_ANY,
+                    &mut key_type,
+                    dump_folder.as_mut_ptr() as *mut _,
+                    &mut dump_folder_len,
+                );
+
+                if ret != ERROR_SUCCESS {
+                    // Default value for dump_folder is %LOCALAPPDATA%\CrashDumps
+                    let mut localappdata: *mut u16 = ptr::null_mut();
+                    SHGetKnownFolderPath(
+                        &FOLDERID_LocalAppData,
+                        0,
+                        ptr::null_mut(),
+                        &mut localappdata,
+                    );
+
+                    let localappdata_len = wcslen(localappdata);
+                    wcsncpy(dump_folder.as_mut_ptr(), localappdata, localappdata_len);
+
+                    let crashdumps = w!("\\CrashDumps");
+                    let crashdumps_len = wcslen(crashdumps);
+                    wcsncpy(
+                        dump_folder.as_mut_ptr().add(localappdata_len),
+                        crashdumps,
+                        crashdumps_len,
+                    );
+
+                    // Null-terminate
+                    dump_folder[localappdata_len + crashdumps_len] = 0;
+
+                    // Free the memory allocated by SHGetKnownFolderPath
+                    CoTaskMemFree(localappdata as _);
+                }
+
+                // Close registry key
+                RegCloseKey(registry_key as HKEY);
+
+                // Create dump folder if it doesn't already exist
+                CreateDirectoryW(dump_folder.as_ptr(), ptr::null());
+
+                // Construct dump filename from process name and PID
+                // Find the null terminator in basename
+                let mut basename_len = 0;
+                while basename_len < basename_buf.len() && basename_buf[basename_len] != 0 {
+                    basename_len += 1;
+                }
+
+                // Copy dump_folder to dump_name
+                let mut dump_folder_len = 0;
+                while dump_folder_len < dump_folder.len() && dump_folder[dump_folder_len] != 0 {
+                    dump_name[dump_folder_len] = dump_folder[dump_folder_len];
+                    dump_folder_len += 1;
+                }
+
+                // Add path separator if needed
+                if dump_folder_len > 0 && dump_name[dump_folder_len - 1] != wchar!('\\') {
+                    dump_name[dump_folder_len] = wchar!('\\');
+                    dump_folder_len += 1;
+                }
+
+                // Concatenate basename
+                for i in 0..basename_len {
+                    dump_name[dump_folder_len + i] = basename_buf[i];
+                }
+                dump_folder_len += basename_len;
+
+                // Add dot and PID
+                dump_name[dump_folder_len] = wchar!('.');
+                dump_folder_len += 1;
+
+                // Convert PID to characters
+                let mut pid_remaining = pid;
+                let mut pid_digits = [0u16; 10]; // Enough for 32-bit number
+                let mut pid_len = 0;
+
+                // Handle zero case explicitly
+                if pid_remaining == 0 {
+                    pid_digits[0] = wchar!('0');
+                    pid_len = 1;
+                } else {
+                    // Extract digits in reverse order
+                    while pid_remaining > 0 {
+                        pid_digits[pid_len] = wchar!('0') + (pid_remaining % 10) as u16;
+                        pid_remaining /= 10;
+                        pid_len += 1;
+                    }
+
+                    // Reverse the digits
+                    for i in 0..pid_len / 2 {
+                        let temp = pid_digits[i];
+                        pid_digits[i] = pid_digits[pid_len - 1 - i];
+                        pid_digits[pid_len - 1 - i] = temp;
+                    }
+                }
+
+                // Add PID digits to dump_name
+                for i in 0..pid_len {
+                    dump_name[dump_folder_len + i] = pid_digits[i];
+                }
+                dump_folder_len += pid_len;
+
+                // Add .dmp extension
+                let dmp_ext = w!(".dmp");
+                let dmp_ext_len = wcslen(dmp_ext);
+                wcsncpy(
+                    dump_name.as_mut_ptr().add(dump_folder_len),
+                    dmp_ext,
+                    dmp_ext_len,
+                );
+                // Set null terminator
+                dump_name[dump_folder_len + dmp_ext_len] = 0;
+
+                // Create dump file
+                let h_dump_file = CreateFileW(
+                    dump_name.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                );
+
+                if h_dump_file != INVALID_HANDLE_VALUE {
+                    // Check against INVALID_HANDLE_VALUE
+                    // If something goes wrong while writing it out, delete the file
+                    let delete_on_close = FILE_DISPOSITION_INFO { DeleteFile: 1 }; // 1 = TRUE for DeleteFile
+                    SetFileInformationByHandle(
+                        h_dump_file,
+                        FileDispositionInfo,
+                        &delete_on_close as *const _ as *const _,
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    );
+
+                    // Tell wine to dump ELF modules as well
+                    let sym_options = SymGetOptions();
+                    SymSetOptions(sym_options | 0x40000000);
+
+                    // We default to a fairly complete dump
+                    let dump_options: MINIDUMP_TYPE = MiniDumpWithFullMemory
+                        | MiniDumpIgnoreInaccessibleMemory
+                        | AVX_XSTATE_CONTEXT;
+
+                    let success = MiniDumpWriteDump(
+                        process_handle,
+                        pid,
+                        h_dump_file,
+                        dump_options,
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                    );
+
+                    if success != 0 {
+                        // Don't delete the file on close if we successfully wrote it out
+                        let dont_delete_on_close = FILE_DISPOSITION_INFO { DeleteFile: 0 }; // 0 = FALSE for DeleteFile
+                        SetFileInformationByHandle(
+                            h_dump_file,
+                            FileDispositionInfo,
+                            &dont_delete_on_close as *const _ as *const _,
+                            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                        );
+                    }
+
+                    // Restore symbol options
+                    SymSetOptions(sym_options);
+
+                    // Close dump file
+                    CloseHandle(h_dump_file);
+                }
+            }
+        }
+    }
+
+    // Handle different signal cases
+    match signum {
+        SIGQUIT | SIGTERM | SIGKILL | SIGINT => {
+            // Unconditionally terminate the process
+            unsafe {
+                if TerminateProcess(process_handle, 1) != 0 {
+                    return 0;
+                }
+
+                // If the process already exited before TerminateProcess was called,
+                // TerminateProcess will fail with ERROR_ACCESS_DENIED
+                let err = GetLastError();
+                if err == ERROR_ACCESS_DENIED {
+                    // First check using GetExitCodeProcess() with status different from
+                    // STILL_ACTIVE (259)
+                    let mut status = 0;
+                    if GetExitCodeProcess(process_handle, &mut status) != 0
+                        && status != STILL_ACTIVE as u32
+                    {
+                        return Error::ESRCH as i32;
+                    }
+
+                    // But the process could have exited with code == STILL_ACTIVE, use
+                    // WaitForSingleObject with timeout zero
+                    if WaitForSingleObject(process_handle, 0) == WAIT_OBJECT_0 {
+                        return Error::ESRCH as i32;
+                    }
+                }
+
+                return uv_translate_sys_error(err);
+            }
+        }
+
+        // Health check: is the process still alive?
+        0 => unsafe {
+            let mut status = 0;
+            if GetExitCodeProcess(process_handle, &mut status) == 0 {
+                return uv_translate_sys_error(GetLastError());
+            }
+
+            if status != STILL_ACTIVE as u32 {
+                return Error::ESRCH as i32;
+            }
+
+            match WaitForSingleObject(process_handle, 0) {
+                WAIT_OBJECT_0 => return Error::ESRCH as i32,
+                WAIT_FAILED => return uv_translate_sys_error(GetLastError()),
+                WAIT_TIMEOUT => return 0,
+                _ => return Error::UNKNOWN as i32,
+            }
+        },
+
+        // Unsupported signal
+        _ => return Error::ENOSYS as i32,
+    }
+}
+
+/// Kill a process using its pid
+pub fn uv_kill(pid: i32, signum: i32) -> i32 {
+    let mut process_handle: HANDLE;
+    let result: i32;
+
+    unsafe {
+        // Get process handle based on pid
+        if pid == 0 {
+            process_handle = GetCurrentProcess();
+        } else {
+            process_handle = OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
+                FALSE,
+                pid as u32,
+            );
+        }
+
+        if process_handle == ptr::null_mut() {
+            let err = GetLastError();
+            if err == ERROR_INVALID_PARAMETER {
+                return Error::ESRCH as i32;
+            } else {
+                return uv_translate_sys_error(err);
+            }
+        }
+
+        // Call uv__kill with the process handle
+        result = uv__kill(process_handle, signum);
+
+        // Close the handle if we opened it
+        if pid != 0 {
+            CloseHandle(process_handle);
+        }
+    }
+
+    result // The error is already translated in uv__kill
+}
+
+/// Kill a process owned by a uv_process_t handle
+pub fn uv_process_kill(process: &mut uv_process) -> i32 {
+    if process.process_handle == INVALID_HANDLE_VALUE {
+        return Error::EINVAL as i32;
+    }
+
+    let err = uv__kill(process.process_handle, SIGTERM);
+    if err != 0 {
+        return err; // err is already translated.
+    }
+
+    process.exit_signal = SIGTERM;
+    0
+}
+
+// Translate a Windows system error into a UV error code
+fn uv_translate_sys_error(err: u32) -> i32 {
+    // Simplified mapping - in a complete implementation this would map
+    // Windows error codes to libuv error codes
+    match err {
+        ERROR_INVALID_PARAMETER => Error::EINVAL as i32,
+        ERROR_ACCESS_DENIED => Error::EACCES as i32,
+        _ => -(err as i32), // Just negate the Windows error code for now
+    }
 }
