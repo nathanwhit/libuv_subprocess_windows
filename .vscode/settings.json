@@ -1,0 +1,7 @@
+{
+  "rust-analyzer.cargo.target": "x86_64-pc-windows-gnu",
+  "deno.enable": true,
+  "clangd.arguments": [
+    "--compile-commands=${workspaceFolder}/libuv/build/compile_commands.json"
+  ]
+}
