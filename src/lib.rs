@@ -40,32 +40,25 @@ mod foo {
             self
         }
 
-        pub fn spawn(&mut self) {
-            let mut process = uv_process::init(null_mut());
-            let mut loop_handle = uv_loop_t::init();
-            process
-                .spawn(
-                    &mut loop_handle,
-                    &uv_process_options {
-                        exit_cb: None,
-                        flags: 0,
-                        file: Cow::Borrowed(&self.program),
-                        args: self
-                            .args
-                            .iter()
-                            .map(|a| Cow::Borrowed(a.as_str()))
-                            .collect(),
-                        env: None,
-                        cwd: None,
-                        stdio_count: 3,
-                        stdio: vec![
-                            StdioContainer::InheritFd(0),
-                            StdioContainer::InheritFd(1),
-                            StdioContainer::InheritFd(2),
-                        ],
-                    },
-                )
-                .unwrap();
+        pub fn spawn(&mut self) -> Result<ChildProcess, Error> {
+            uv_process::spawn(&uv_process_options {
+                exit_cb: None,
+                flags: 0,
+                file: Cow::Borrowed(&self.program),
+                args: self
+                    .args
+                    .iter()
+                    .map(|a| Cow::Borrowed(a.as_str()))
+                    .collect(),
+                env: None,
+                cwd: None,
+                stdio_count: 3,
+                stdio: vec![
+                    StdioContainer::InheritFd(0),
+                    StdioContainer::InheritFd(1),
+                    StdioContainer::InheritFd(2),
+                ],
+            })
         }
     }
 }

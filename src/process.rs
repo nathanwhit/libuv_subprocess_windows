@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+use futures_channel::oneshot;
 use windows_sys::{
     Win32::{
         Foundation::{
@@ -46,7 +47,7 @@ use windows_sys::{
             Threading::{
                 CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
                 CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
-                GetExitCodeProcess, GetProcessId, OpenProcess, PROCESS_INFORMATION,
+                GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, PROCESS_INFORMATION,
                 PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, RegisterWaitForSingleObject,
                 ResumeThread, STARTUPINFOW, TerminateProcess, UnregisterWait, UnregisterWaitEx,
                 WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE, WaitForSingleObject,
@@ -244,7 +245,17 @@ pub struct uv_process {
     process_handle: RawHandle,
     exit_cb_pending: AtomicBool,
     exit_req: uv_req,
+    waiting: Option<Waiting>,
 }
+
+struct Waiting {
+    rx: oneshot::Receiver<()>,
+    wait_object: HANDLE,
+    tx: *mut Option<oneshot::Sender<()>>,
+}
+
+unsafe impl Sync for Waiting {}
+unsafe impl Send for Waiting {}
 
 pub struct uv_process_options<'a> {
     pub exit_cb: Option<fn(*const uv_process, u64, i32)>,
@@ -376,6 +387,55 @@ fn make_program_args(args: &[&str], verbatim_arguments: bool) -> Result<WCString
     Ok(wcstring)
 }
 
+fn cvt(result: BOOL) -> Result<(), std::io::Error> {
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub struct ChildProcess {
+    pid: i32,
+    exit_signal: Option<i32>,
+    exit_code: Option<i64>,
+    handle: HANDLE,
+    main_thread_handle: HANDLE,
+    waiting: Option<Waiting>,
+}
+
+impl ChildProcess {
+    pub fn try_wait(&mut self) -> Result<Option<i32>, std::io::Error> {
+        unsafe {
+            match WaitForSingleObject(self.handle, 0) {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => return Ok(None),
+                // TODO: io error probably
+                _ => {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
+            let mut status = 0;
+            cvt(GetExitCodeProcess(self.handle, &mut status))?;
+            Ok(Some(status as i32))
+        }
+    }
+
+    pub fn wait(&mut self) -> Result<i32, std::io::Error> {
+        unsafe {
+            let res = WaitForSingleObject(self.handle, INFINITE);
+            if res != WAIT_OBJECT_0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let mut status = 0;
+            cvt(GetExitCodeProcess(self.handle, &mut status))?;
+            Ok(status as i32)
+        }
+    }
+}
+
 impl uv_process {
     pub fn init(_loop_handle: *mut uv_loop_t) -> Self {
         Self {
@@ -388,14 +448,12 @@ impl uv_process {
             exit_req: uv_req {
                 data: ptr::null_mut(),
             },
+            waiting: None,
         }
     }
 
-    pub fn spawn(
-        &mut self,
-        loop_handle: &mut uv_loop_t,
-        options: &uv_process_options,
-    ) -> Result<(), Error> {
+    pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
+        // let mut process = Self::init(ptr::null_mut());
         eprintln!("uv_spawn start");
         let mut err: u32 = 0;
         let mut path: Option<&[u16]> = None;
@@ -411,7 +469,7 @@ impl uv_process {
         let mut cwd_len: u32 = 0;
 
         // Initialize the process
-        self.exit_cb = options.exit_cb;
+        // process.exit_cb = options.exit_cb;
 
         // Validate options
         if options.flags & (uv_process_flags::SetUid | uv_process_flags::SetGid) != 0 {
@@ -688,9 +746,14 @@ impl uv_process {
             }
         }
 
-        // Process creation succeeded
-        self.process_handle = info.hProcess;
-        self.pid = info.dwProcessId as i32;
+        let mut child = ChildProcess {
+            pid: info.dwProcessId as i32,
+            exit_signal: None,
+            exit_code: None,
+            handle: info.hProcess,
+            main_thread_handle: info.hThread,
+            waiting: None,
+        };
 
         // Set IPC pid to all IPC pipes (stubbed for now)
         // for i in 0..options.stdio_count {
@@ -702,27 +765,27 @@ impl uv_process {
         //     }
         // }
 
-        eprintln!("RegisterWaitForSingleObject");
-        // Setup notifications for when the child process exits
-        let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = ptr::null_mut();
-        let result = unsafe {
-            windows_sys::Win32::System::Threading::RegisterWaitForSingleObject(
-                &mut wait_handle,
-                self.process_handle,
-                Some(exit_wait_callback),
-                self as *mut _ as *mut _,
-                u32::MAX, // INFINITE
-                windows_sys::Win32::System::Threading::WT_EXECUTEINWAITTHREAD
-                    | windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
-            )
-        };
+        // eprintln!("RegisterWaitForSingleObject");
+        // // Setup notifications for when the child process exits
+        // let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = ptr::null_mut();
+        // let result = unsafe {
+        //     windows_sys::Win32::System::Threading::RegisterWaitForSingleObject(
+        //         &mut wait_handle,
+        //         child.handle,
+        //         Some(exit_wait_callback),
+        //         &mut child.waiting as *mut _ as *mut _,
+        //         u32::MAX, // INFINITE
+        //         windows_sys::Win32::System::Threading::WT_EXECUTEINWAITTHREAD
+        //             | windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
+        //     )
+        // };
 
-        if result == 0 {
-            uv_fatal_error("RegisterWaitForSingleObject")
-        }
-        eprintln!("RegisterWaitForSingleObject done");
+        // if result == 0 {
+        //     uv_fatal_error("RegisterWaitForSingleObject")
+        // }
+        // eprintln!("RegisterWaitForSingleObject done");
 
-        self.wait_handle = wait_handle;
+        // self.wait_handle = wait_handle;
 
         eprintln!("close thread handle");
 
@@ -745,7 +808,7 @@ impl uv_process {
             eprintln!("Freeing stdio buffer done");
         }
 
-        Ok(())
+        Ok(child)
     }
 }
 
@@ -1702,11 +1765,11 @@ unsafe extern "system" fn exit_wait_callback(data: *mut c_void, _timer_fired: u8
     // In a real implementation, this would post a completion to the event loop
     // POST_COMPLETION_FOR_REQ(loop, &process->exit_req);
     // For now, we'll directly call the process exit handler as a stub
-    // uv__process_proc_exit(loop, process);
+    uv__process_proc_exit(process);
 }
 
 // Process the exit of a child process
-pub fn uv__process_proc_exit(_loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+pub fn uv__process_proc_exit(process: &mut uv_process) {
     let mut exit_code: i64 = 0;
 
     assert!(process.exit_cb_pending.load(Ordering::Relaxed));

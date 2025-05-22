@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-channel = "0.3.31"
 libc = "0.2.172"
 
 [target.x86_64-pc-windows-gnu.dependencies]
