@@ -1,4 +1,4 @@
-use std::{ffi::c_int, mem::ManuallyDrop, ptr::null_mut};
+use std::{ffi::c_int, ptr::null_mut};
 
 use buffer::StdioBuffer;
 use windows_sys::Win32::{
@@ -68,8 +68,8 @@ unsafe fn uv_stdio_verify(buffer: *mut u8, size: u16) -> bool {
     true
 }
 
-unsafe fn uv_create_nul_handle(access: u32) -> Result<HANDLE, Error> {
-    let mut sa = SECURITY_ATTRIBUTES {
+fn uv_create_nul_handle(access: u32) -> Result<HANDLE, Error> {
+    let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: null_mut(),
         bInheritHandle: 1,
@@ -110,7 +110,14 @@ pub(crate) unsafe fn uv_stdio_size(buffer: *mut u8) -> u16 {
 
 pub(crate) unsafe fn uv_stdio_handle(buffer: *mut u8, fd: i32) -> HANDLE {
     let mut handle = INVALID_HANDLE_VALUE;
-    unsafe { copy_handle(child_stdio_handle(buffer, fd).cast::<HANDLE>().read_unaligned(), &mut handle) };
+    unsafe {
+        copy_handle(
+            child_stdio_handle(buffer, fd)
+                .cast::<HANDLE>()
+                .read_unaligned(),
+            &mut handle,
+        )
+    };
     handle
 }
 
@@ -171,8 +178,11 @@ fn uv_duplicate_fd(fd: i32) -> Result<HANDLE, Error> {
     unsafe { uv_duplicate_handle(handle) }
 }
 
-unsafe fn copy_handle(handle: HANDLE, dest: *mut HANDLE) {
-    unsafe { std::ptr::write_unaligned(dest, handle) };
+unsafe fn copy_handle(mut handle: HANDLE, dest: *mut HANDLE) {
+    let handle = &raw mut handle;
+    unsafe {
+        std::ptr::copy_nonoverlapping(handle.cast::<u8>(), dest.cast::<u8>(), size_of::<HANDLE>())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,7 +195,7 @@ pub enum StdioContainer {
 pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffer, Error> {
     eprintln!("uv_stdio_create");
     let mut count = options.stdio_count;
-    if count < 0 || count > 255 {
+    if count > 255 {
         return Err(Error::EINVAL);
     } else if count < 3 {
         count = 3;
@@ -208,16 +218,16 @@ pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffe
                     } else {
                         FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES
                     };
-                    let nul = unsafe { uv_create_nul_handle(access) }?;
+                    let nul = uv_create_nul_handle(access)?;
                     buffer.set_handle(i as i32, nul);
                     buffer.set_flags(i as i32, FOPEN | FDEV);
                 }
             },
             StdioContainer::InheritFd(fd) => {
-                let handle = unsafe { uv_duplicate_fd(fd) };
+                let handle = uv_duplicate_fd(fd);
                 let handle = match handle {
                     Ok(handle) => handle,
-                    Err(e) if fd <= 2 => {
+                    Err(_) if fd <= 2 => {
                         unsafe { buffer.set_flags(fd, 0) };
                         unsafe { buffer.set_handle(fd, INVALID_HANDLE_VALUE) };
                         continue;
@@ -276,8 +286,6 @@ mod buffer {
             }
         }
     }
-
-
 
     impl StdioBuffer {
         pub unsafe fn from_raw(ptr: *mut u8) -> Self {

@@ -11,7 +11,7 @@ pub use foo::Command;
 #[cfg(windows)]
 mod foo {
     use std::borrow::Cow;
-    use std::ptr::null_mut;
+    use std::collections::HashMap;
 
     use crate::process::*;
     use crate::process_stdio::*;
@@ -19,6 +19,8 @@ mod foo {
     pub struct Command {
         program: String,
         args: Vec<String>,
+        envs: HashMap<String, String>,
+        env_clear: bool,
     }
 
     impl Command {
@@ -26,6 +28,8 @@ mod foo {
             Self {
                 program: program.as_ref().to_string(),
                 args: vec![],
+                envs: HashMap::new(),
+                env_clear: false,
             }
         }
 
@@ -40,6 +44,18 @@ mod foo {
             self
         }
 
+        pub fn env<S: AsRef<str>>(&mut self, key: S, value: S) -> &mut Self {
+            self.envs
+                .insert(key.as_ref().to_string(), value.as_ref().to_string());
+            self
+        }
+
+        pub fn env_clear(&mut self) -> &mut Self {
+            self.env_clear = true;
+            self.envs.clear();
+            self
+        }
+
         pub fn spawn(&mut self) -> Result<ChildProcess, Error> {
             uv_process::spawn(&uv_process_options {
                 exit_cb: None,
@@ -50,7 +66,24 @@ mod foo {
                     .iter()
                     .map(|a| Cow::Borrowed(a.as_str()))
                     .collect(),
-                env: None,
+                env: if self.envs.is_empty() {
+                    if self.env_clear { Some(vec![]) } else { None }
+                } else {
+                    let explicit_envs = self
+                        .envs
+                        .iter()
+                        .map(|(k, v)| Cow::<str>::Owned(format!("{}={}", k, v)));
+                    let env: Vec<Cow<str>> = if self.env_clear {
+                        explicit_envs.collect()
+                    } else {
+                        explicit_envs
+                            .chain(
+                                std::env::vars().map(|(k, v)| Cow::Owned(format!("{}={}", k, v))),
+                            )
+                            .collect()
+                    };
+                    Some(env)
+                },
                 cwd: None,
                 stdio_count: 3,
                 stdio: vec![
