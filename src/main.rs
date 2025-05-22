@@ -1,3 +1,8 @@
+use libuv_subprocess_windows::Command;
+
 fn main() {
-    println!("Hello, world!");
+    let mut cmd = Command::new("deno");
+    cmd.arg("eval")
+        .arg("Deno.writeTextFileSync('D:\\Work\\foo.txt', 'hi')");
+    cmd.spawn();
 }

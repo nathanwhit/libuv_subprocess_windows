@@ -1,6 +1,8 @@
 {
   "tasks": {
-    "build": "cargo build --target=x86_64-pc-windows-gnu"
+    "build": "cargo build --target=x86_64-pc-windows-gnu",
+    "cp-remote": "scp target/x86_64-pc-windows-gnu/debug/libuv-subprocess-windows.exe nwhit@192.168.0.24:\"D:\\Work\\libuv-subprocess-windows.exe\"",
+    "runsan": "RUSTFLAGS=-Zsanitizer=address cargo +nightly r"
   },
   "lock": false
 }

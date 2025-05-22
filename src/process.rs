@@ -1,26 +1,32 @@
-#![allow(nonstandard_style)]
+#![allow(nonstandard_style, dead_code)]
 use std::{
     borrow::Cow,
-    ffi::CStr,
+    convert::TryInto,
+    ffi::{CStr, c_void},
     mem,
     ops::{BitAnd, BitOr},
-    os::windows::raw::HANDLE,
+    os::windows::raw::HANDLE as RawHandle,
     ptr::{self, null, null_mut},
-    sync::{OnceLock, atomic::AtomicBool},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use windows_sys::{
     Win32::{
         Foundation::{
-            BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FALSE,
-            GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
-            WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+            ERROR_OUTOFMEMORY, ERROR_SUCCESS, FALSE, GENERIC_WRITE, GetLastError, HANDLE,
+            INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         },
         Globalization::GetSystemDefaultLangID,
         Security::SECURITY_ATTRIBUTES,
         Storage::FileSystem::{
             CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-            FILE_DISPOSITION_INFO, FileDispositionInfo, SYNCHRONIZE, SetFileInformationByHandle,
+            FILE_DISPOSITION_INFO, FileDispositionInfo, GetShortPathNameW, SYNCHRONIZE,
+            SetFileInformationByHandle,
         },
         System::{
             Com::CoTaskMemFree,
@@ -30,16 +36,20 @@ use windows_sys::{
                 MiniDumpIgnoreInaccessibleMemory, MiniDumpWithFullMemory, MiniDumpWriteDump,
                 SymGetOptions, SymSetOptions,
             },
-            Environment::GetEnvironmentVariableW,
+            Environment::{GetEnvironmentVariableW, NeedCurrentDirectoryForExePathW},
+            JobObjects::{JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation},
             ProcessStatus::GetModuleBaseNameW,
             Registry::{
                 HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RRF_RT_ANY, RegCloseKey, RegGetValueW,
                 RegOpenKeyExW,
             },
             Threading::{
-                GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcess,
-                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
-                WaitForSingleObject,
+                CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+                CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
+                GetExitCodeProcess, GetProcessId, OpenProcess, PROCESS_INFORMATION,
+                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, RegisterWaitForSingleObject,
+                ResumeThread, STARTUPINFOW, TerminateProcess, UnregisterWait, UnregisterWaitEx,
+                WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE, WaitForSingleObject,
             },
         },
         UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
@@ -47,7 +57,10 @@ use windows_sys::{
     w,
 };
 
-use crate::widestr::{WCStr, WCString};
+use crate::{
+    process_stdio::{StdioContainer, free_stdio_buffer, uv_stdio_create},
+    widestr::{WCStr, WCString},
+};
 
 unsafe extern "C" {
     fn wcsncpy(dest: *mut u16, src: *const u16, count: usize);
@@ -175,21 +188,73 @@ fn uv_init_global_job_handle() {
     });
 }
 
-struct uv_process {
+#[repr(C)]
+struct uv_req {
+    data: *mut c_void,
+}
+
+pub struct uv_stdio_container {
+    pub flags: u32,
+    pub data: StdioData,
+}
+
+pub enum StdioData {
+    Stream(*mut c_void), // Would be `uv_stream_t` in libuv
+    Fd(i32),
+}
+
+// Define handle types
+#[repr(i32)]
+enum HandleType {
+    Unknown = 0,
+    Process = 10,
+}
+
+// Define request types
+#[repr(i32)]
+enum RequestType {
+    Unknown = 0,
+    ProcessExit = 9,
+}
+
+// Stub for uv_handle
+struct uv_handle_t {
+    data: *mut c_void,
+    loop_handle: *mut uv_loop_t, // Would be `uv_loop_t`
+    handle_type: HandleType,
+    close_cb: Option<fn(*mut uv_handle_t)>,
+}
+
+// Stub for uv_loop
+pub struct uv_loop_t {
+    data: *mut c_void,
+}
+
+impl uv_loop_t {
+    pub fn init() -> Self {
+        Self { data: null_mut() }
+    }
+}
+
+pub struct uv_process {
     pid: i32,
     exit_cb: Option<fn(*const uv_process, u64, i32)>,
     exit_signal: i32,
-    wait_handle: HANDLE,
-    process_handle: HANDLE,
+    wait_handle: RawHandle,
+    process_handle: RawHandle,
     exit_cb_pending: AtomicBool,
-    // maybe uv_req?
+    exit_req: uv_req,
 }
 
-struct uv_process_options<'a> {
-    exit_cb: Option<fn(*const uv_process, u64, i32)>,
-    flags: u32,
-    file: Cow<'a, str>,
-    args: *const *const u8,
+pub struct uv_process_options<'a> {
+    pub exit_cb: Option<fn(*const uv_process, u64, i32)>,
+    pub flags: u32,
+    pub file: Cow<'a, str>,
+    pub args: Vec<Cow<'a, str>>,
+    pub env: Option<Vec<Cow<'a, str>>>,
+    pub cwd: Option<Cow<'a, str>>,
+    pub stdio_count: usize,
+    pub stdio: Vec<super::process_stdio::StdioContainer>,
 }
 
 macro_rules! wchar {
@@ -266,10 +331,7 @@ fn quote_cmd_arg(src: &WCStr, target: &mut Vec<u16>) {
         }
     }
 
-    target.push(wchar!('\0'));
-    let len = target.len();
-    target[start..len - 1].reverse();
-
+    target[start..].reverse();
     target.push(wchar!('"'));
 }
 
@@ -294,11 +356,14 @@ fn make_program_args(args: &[&str], verbatim_arguments: bool) -> Result<WCString
     let mut temp_buffer = Vec::with_capacity(temp_buffer_len);
 
     for (i, arg) in args.iter().enumerate() {
+        temp_buffer.clear();
         temp_buffer.extend(arg.encode_utf16());
 
         if verbatim_arguments {
             dst.extend(temp_buffer.as_slice());
         } else {
+            // Add null terminator for WCStr, but only temporarily
+            temp_buffer.push(0);
             quote_cmd_arg(unsafe { WCStr::from_wchars(&temp_buffer) }, &mut dst);
         }
 
@@ -312,7 +377,7 @@ fn make_program_args(args: &[&str], verbatim_arguments: bool) -> Result<WCString
 }
 
 impl uv_process {
-    pub fn init() -> Self {
+    pub fn init(_loop_handle: *mut uv_loop_t) -> Self {
         Self {
             exit_cb: None,
             exit_signal: 0,
@@ -320,38 +385,372 @@ impl uv_process {
             wait_handle: INVALID_HANDLE_VALUE,
             process_handle: INVALID_HANDLE_VALUE,
             exit_cb_pending: AtomicBool::new(false),
+            exit_req: uv_req {
+                data: ptr::null_mut(),
+            },
         }
     }
 
-    pub fn spawn(&mut self, options: &uv_process_options) -> Result<(), Error> {
-        // let mut i = 0;
-        // let mut err = 0;
-        // let mut path = None;
-        // let mut alloc_path = None;
-        // let mut application_path = None;
-        // let mut application = None;
-        // let mut arguments = None;
-        // let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
-        // let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
-        // let mut process_flags = 0;
-        // let mut cwd_len = 0;
-        // let mut child_stdio_buffer = None;
+    pub fn spawn(
+        &mut self,
+        loop_handle: &mut uv_loop_t,
+        options: &uv_process_options,
+    ) -> Result<(), Error> {
+        eprintln!("uv_spawn start");
+        let mut err: u32 = 0;
+        let mut path: Option<&[u16]> = None;
+        let mut alloc_path: Option<Vec<u16>> = None;
+        let mut application_path: Option<WCString> = None;
+        let mut application: Option<WCString> = None;
+        let mut arguments: Option<WCString> = None;
+        let mut env: Option<WCString> = None;
+        let mut cwd: Option<WCString> = None;
+        let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
+        let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
+        let mut process_flags: u32 = 0;
+        let mut cwd_len: u32 = 0;
 
-        // self.exit_cb = options.exit_cb;
+        // Initialize the process
+        self.exit_cb = options.exit_cb;
 
-        // if options.flags & (uv_process_flags::SetUid | uv_process_flags::SetGid) != 0 {
-        //     return Err(Error::ENOTSUP);
+        // Validate options
+        if options.flags & (uv_process_flags::SetUid | uv_process_flags::SetGid) != 0 {
+            return Err(Error::ENOTSUP);
+        }
+
+        if options.file.is_empty() || options.args.is_empty() {
+            return Err(Error::EINVAL);
+        }
+
+        eprintln!("making application");
+        // Convert file path to UTF-16
+        application = Some(WCString::new(&options.file));
+
+        // Create command line arguments
+        eprintln!("making program args: {application:?}");
+        let args: Vec<&str> = options.args.iter().map(|s| s.as_ref()).collect();
+        let verbatim_arguments = (options.flags & uv_process_flags::WindowsVerbatimArguments) != 0;
+        arguments = match make_program_args(&args, verbatim_arguments) {
+            Ok(args) => Some(args),
+            Err(e) => return Err(e),
+        };
+        eprintln!("made args: {arguments:?}");
+
+        // Create environment block if provided
+        if let Some(env_block) = &options.env {
+            let env_strs: Vec<&str> = env_block.iter().map(|s| s.as_ref()).collect();
+            env = match make_program_env(Some(&env_strs)) {
+                Ok(env_block) => Some(env_block),
+                Err(e) => return Err(e),
+            };
+        }
+
+        eprintln!("made env");
+        // Handle current working directory
+        if let Some(cwd_option) = &options.cwd {
+            // Explicit cwd
+            cwd = Some(WCString::new(cwd_option));
+            let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
+            cwd_len = unsafe { wcslen(cwd_ptr) as u32 };
+        } else {
+            // Inherit cwd
+            // Get current directory length
+            unsafe {
+                cwd_len = windows_sys::Win32::System::Environment::GetCurrentDirectoryW(
+                    0,
+                    ptr::null_mut(),
+                );
+                if cwd_len == 0 {
+                    err = GetLastError();
+                    return Err(translate_sys_error(err));
+                }
+
+                // Allocate buffer for current directory
+                let mut cwd_buf = vec![0u16; cwd_len as usize];
+                let r = windows_sys::Win32::System::Environment::GetCurrentDirectoryW(
+                    cwd_len,
+                    cwd_buf.as_mut_ptr(),
+                );
+                if r == 0 || r >= cwd_len {
+                    err = GetLastError();
+                    return Err(translate_sys_error(err));
+                }
+
+                cwd = Some(WCString::from_vec(cwd_buf));
+            }
+        }
+
+        // If cwd is too long, shorten it
+        if cwd_len as usize >= windows_sys::Win32::Foundation::MAX_PATH as usize {
+            unsafe {
+                let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
+                let mut short_buf = vec![0u16; cwd_len as usize];
+                cwd_len = windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                    cwd_ptr,
+                    short_buf.as_mut_ptr(),
+                    cwd_len,
+                );
+                if cwd_len == 0 {
+                    err = GetLastError();
+                    return Err(translate_sys_error(err));
+                }
+                cwd = Some(WCString::from_vec(short_buf));
+            }
+        }
+
+        eprintln!("made cwd: {cwd:?}");
+        // Get PATH environment variable
+        if let Some(env_ref) = &env {
+            // Try to find PATH in the provided environment block
+            let env_ptr = env_ref.as_ptr();
+            let env_slice = unsafe {
+                let len = wcslen(env_ptr);
+                std::slice::from_raw_parts(env_ptr, len)
+            };
+            path = find_path(env_slice);
+        }
+
+        if path.is_none() {
+            // PATH not found in provided environment, get system PATH
+            unsafe {
+                let path_len = windows_sys::Win32::System::Environment::GetEnvironmentVariableW(
+                    w!("PATH"),
+                    ptr::null_mut(),
+                    0,
+                );
+                if path_len != 0 {
+                    let mut path_buf = vec![0u16; path_len as usize];
+                    let r = windows_sys::Win32::System::Environment::GetEnvironmentVariableW(
+                        w!("PATH"),
+                        path_buf.as_mut_ptr(),
+                        path_len,
+                    );
+                    if r == 0 || r >= path_len {
+                        err = GetLastError();
+                        return Err(translate_sys_error(err));
+                    }
+                    alloc_path = Some(path_buf);
+                    path = Some(&alloc_path.as_ref().unwrap()[..]);
+                }
+            }
+        }
+
+        eprintln!(
+            "got path: {:?}",
+            path.as_ref().map(|slice| String::from_utf16_lossy(slice))
+        );
+        // Create and set up stdio
+        let child_stdio_buffer = uv_stdio_create(options)?;
+
+        // child_stdio_buffer = Some(uv__stdio_create(loop_handle, options, &child_stdio_buffer));
+        // if child_stdio_buffer.is_none() {
+        //    return Err(Error::UNKNOWN);
         // }
 
-        // if options.file == None || options.args == None {
-        //     return Err(Error::EINVAL);
+        eprintln!("made stdio");
+        // Search for the executable
+
+        eprintln!("made cwd");
+        application_path = search_path(
+            application.as_ref().map(|s| s.as_slice_no_nul()).unwrap(),
+            cwd.as_ref().map(|s| s.as_slice_no_nul()).unwrap(),
+            path,
+            options.flags,
+        );
+        if application_path.is_none() {
+            // Executable not found
+            return Err(translate_sys_error(ERROR_FILE_NOT_FOUND));
+        }
+
+        println!("application_path: {}", application_path.as_ref().unwrap());
+
+        // Set up process creation
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        startup.lpReserved = ptr::null_mut();
+        startup.lpDesktop = ptr::null_mut();
+        startup.lpTitle = ptr::null_mut();
+        startup.dwFlags = windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES
+            | windows_sys::Win32::System::Threading::STARTF_USESHOWWINDOW;
+
+        startup.cbReserved2 = child_stdio_buffer.size() as u16;
+        startup.hStdInput = unsafe { child_stdio_buffer.get_handle(0) };
+        startup.hStdOutput = unsafe { child_stdio_buffer.get_handle(1) };
+        startup.hStdError = unsafe { child_stdio_buffer.get_handle(2) };
+
+        startup.lpReserved2 = child_stdio_buffer.into_raw();
+
+        // Set up process flags
+        process_flags = windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+
+        // Handle console window visibility
+        if (options.flags & uv_process_flags::WindowsHideConsole) != 0
+            || (options.flags & uv_process_flags::WindowsHide) != 0
+        {
+            // Avoid creating console window if stdio is not inherited
+            let mut can_hide = true;
+            for i in 0..options.stdio_count {
+                if matches!(options.stdio[i], StdioContainer::InheritFd(_)) {
+                    can_hide = false;
+                    break;
+                }
+            }
+            if can_hide {
+                process_flags |= windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+            }
+        }
+
+        // Set window show state
+        if (options.flags & uv_process_flags::WindowsHideGui) != 0
+            || (options.flags & uv_process_flags::WindowsHide) != 0
+        {
+            startup.wShowWindow = windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE as u16;
+        } else {
+            startup.wShowWindow =
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT as u16;
+        }
+
+        // Handle detached processes
+        if (options.flags & uv_process_flags::Detached) != 0 {
+            process_flags |= windows_sys::Win32::System::Threading::DETACHED_PROCESS
+                | windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+                | windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        }
+
+        // Create the process
+        let app_path_ptr = application_path.as_ref().unwrap().as_ptr();
+        let args_ptr = arguments.as_ref().unwrap().as_ptr();
+        let env_ptr = if let Some(ref e) = env {
+            e.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
+
+        let create_result = unsafe {
+            windows_sys::Win32::System::Threading::CreateProcessW(
+                app_path_ptr,         // Application path
+                args_ptr as *mut u16, // Command line
+                ptr::null(),          // Process attributes
+                ptr::null(),          // Thread attributes
+                TRUE,                 // Inherit handles
+                process_flags,        // Creation flags
+                env_ptr as *mut _,    // Environment
+                cwd_ptr,              // Current directory
+                &startup,             // Startup info
+                &mut info,            // Process information
+            )
+        };
+
+        eprintln!("CreateProcessW result: {}", create_result);
+        if create_result == 0 {
+            // CreateProcessW failed
+            err = unsafe { GetLastError() };
+            return Err(translate_sys_error(err));
+        }
+
+        // If the process isn't spawned as detached, assign to the global job object
+        if (options.flags & uv_process_flags::Detached) == 0 {
+            eprintln!("Assigning process to job object");
+            uv_init_global_job_handle();
+            eprintln!(
+                "Global job handle: {:?}",
+                UV_GLOBAL_JOB_HANDLE.get().unwrap().0
+            );
+            let job_handle = UV_GLOBAL_JOB_HANDLE.get().unwrap().0;
+
+            unsafe {
+                if windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                    job_handle,
+                    info.hProcess,
+                ) == 0
+                {
+                    // AssignProcessToJobObject might fail if this process is under job control
+                    // and the job doesn't have the JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK flag set,
+                    // on a Windows version that doesn't support nested jobs.
+                    let err = GetLastError();
+                    if err != ERROR_ACCESS_DENIED {
+                        uv_fatal_error_with_no("AssignProcessToJobObject", Some(err));
+                    }
+                }
+            }
+            eprintln!("AssignProcessToJobObject done");
+        }
+
+        eprintln!("ResumeThread");
+        // Resume thread if it was suspended
+        if (process_flags & windows_sys::Win32::System::Threading::CREATE_SUSPENDED) != 0 {
+            unsafe {
+                if windows_sys::Win32::System::Threading::ResumeThread(info.hThread) == u32::MAX {
+                    err = GetLastError();
+                    windows_sys::Win32::System::Threading::TerminateProcess(info.hProcess, 1);
+                    return Err(translate_sys_error(err));
+                }
+            }
+        }
+
+        // Process creation succeeded
+        self.process_handle = info.hProcess;
+        self.pid = info.dwProcessId as i32;
+
+        // Set IPC pid to all IPC pipes (stubbed for now)
+        // for i in 0..options.stdio_count {
+        //     let fdopt = &options.stdio[i];
+        //     if fdopt.flags & UV_CREATE_PIPE != 0 &&
+        //        fdopt.data.stream.type == UV_NAMED_PIPE &&
+        //        ((uv_pipe_t*) fdopt.data.stream).ipc {
+        //        ((uv_pipe_t*) fdopt.data.stream).pipe.conn.ipc_remote_pid = info.dwProcessId;
+        //     }
         // }
 
-        todo!()
+        eprintln!("RegisterWaitForSingleObject");
+        // Setup notifications for when the child process exits
+        let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = ptr::null_mut();
+        let result = unsafe {
+            windows_sys::Win32::System::Threading::RegisterWaitForSingleObject(
+                &mut wait_handle,
+                self.process_handle,
+                Some(exit_wait_callback),
+                self as *mut _ as *mut _,
+                u32::MAX, // INFINITE
+                windows_sys::Win32::System::Threading::WT_EXECUTEINWAITTHREAD
+                    | windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
+            )
+        };
+
+        if result == 0 {
+            uv_fatal_error("RegisterWaitForSingleObject")
+        }
+        eprintln!("RegisterWaitForSingleObject done");
+
+        self.wait_handle = wait_handle;
+
+        eprintln!("close thread handle");
+
+        // Close the thread handle as we don't need it
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(info.hThread) };
+
+        drop(application);
+        drop(application_path);
+        drop(arguments);
+        drop(cwd);
+        drop(env);
+        drop(alloc_path);
+
+        if !startup.lpReserved2.is_null() {
+            // Mark handle as active
+            // In a real implementation, this would be done via uv__handle_start(process)
+            // For now, we'll consider it active
+            eprintln!("Freeing stdio buffer");
+            unsafe { free_stdio_buffer(startup.lpReserved2) };
+            eprintln!("Freeing stdio buffer done");
+        }
+
+        Ok(())
     }
 }
 
-enum Error {
+#[derive(Debug, Clone, Copy)]
+pub enum Error {
     ENOTSUP,
     EINVAL,
     ENOMEM,
@@ -435,6 +834,12 @@ pub enum uv_process_flags {
     WindowsFilePathExactName = 1 << 7,
 }
 
+// Constants for stdio handle types
+pub const UV_IGNORE: u32 = 0;
+pub const UV_CREATE_PIPE: u32 = 1;
+pub const UV_INHERIT_FD: u32 = 2;
+pub const UV_INHERIT_STREAM: u32 = 4;
+
 fn search_path_join_test(dir: &[u16], name: &[u16], ext: &[u16], cwd: &[u16]) -> Option<WCString> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
@@ -473,7 +878,7 @@ fn search_path_join_test(dir: &[u16], name: &[u16], ext: &[u16], cwd: &[u16]) ->
     }
 
     // Allocate buffer for output
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(128);
 
     // Copy cwd
     if cwd_len > 0 {
@@ -523,9 +928,12 @@ fn search_path_join_test(dir: &[u16], name: &[u16], ext: &[u16], cwd: &[u16]) ->
     }
 }
 
-fn search_path_walk_ext(dir: &[u16], name: &[u16], ext: &[u16], cwd: &[u16]) -> Option<WCString> {
-    let name_has_ext = !ext.is_empty();
-
+fn search_path_walk_ext(
+    dir: &[u16],
+    name: &[u16],
+    cwd: &[u16],
+    name_has_ext: bool,
+) -> Option<WCString> {
     // If the name itself has a nonempty extension, try this extension first
     if name_has_ext {
         if let Some(result) = search_path_join_test(dir, name, &[], cwd) {
@@ -823,6 +1231,7 @@ fn make_program_env(env_block: Option<&[&str]>) -> Result<WCString, Error> {
 }
 
 fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> Option<WCString> {
+    eprintln!("search path");
     // If the caller supplies an empty filename,
     // we're not gonna return c:\windows\.exe -- GFY!
     if file.is_empty() || (file.len() == 1 && file[0] == wchar!('.')) {
@@ -850,7 +1259,12 @@ fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> O
 
     if file_has_dir {
         // The file has a path inside, don't use path
-        return search_path_walk_ext(&file[..file_name_start], &file[file_name_start..], &[], cwd);
+        return search_path_walk_ext(
+            &file[..file_name_start],
+            &file[file_name_start..],
+            cwd,
+            name_has_ext,
+        );
     } else {
         // Check if we need to search in the current directory first
         use windows_sys::Win32::System::Environment::NeedCurrentDirectoryForExePathW;
@@ -859,7 +1273,7 @@ fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> O
 
         if need_cwd {
             // The file is really only a name; look in cwd first, then scan path
-            if let Some(result) = search_path_walk_ext(&[], file, &[], cwd) {
+            if let Some(result) = search_path_walk_ext(&[], file, cwd, name_has_ext) {
                 return Some(result);
             }
         }
@@ -924,7 +1338,7 @@ fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, flags: u32) -> O
                 }
             }
 
-            if let Some(result) = search_path_walk_ext(dir_path, file, &[], cwd) {
+            if let Some(result) = search_path_walk_ext(dir_path, file, cwd, name_has_ext) {
                 return Some(result);
             }
         }
@@ -1193,7 +1607,7 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> i32 {
                     }
                 }
 
-                return uv_translate_sys_error(err);
+                return translate_sys_error(err) as i32;
             }
         }
 
@@ -1201,7 +1615,7 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> i32 {
         0 => unsafe {
             let mut status = 0;
             if GetExitCodeProcess(process_handle, &mut status) == 0 {
-                return uv_translate_sys_error(GetLastError());
+                return translate_sys_error(GetLastError()) as i32;
             }
 
             if status != STILL_ACTIVE as u32 {
@@ -1210,7 +1624,7 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> i32 {
 
             match WaitForSingleObject(process_handle, 0) {
                 WAIT_OBJECT_0 => return Error::ESRCH as i32,
-                WAIT_FAILED => return uv_translate_sys_error(GetLastError()),
+                WAIT_FAILED => return translate_sys_error(GetLastError()) as i32,
                 WAIT_TIMEOUT => return 0,
                 _ => return Error::UNKNOWN as i32,
             }
@@ -1243,7 +1657,7 @@ pub fn uv_kill(pid: i32, signum: i32) -> i32 {
             if err == ERROR_INVALID_PARAMETER {
                 return Error::ESRCH as i32;
             } else {
-                return uv_translate_sys_error(err);
+                return translate_sys_error(err) as i32;
             }
         }
 
@@ -1274,13 +1688,149 @@ pub fn uv_process_kill(process: &mut uv_process) -> i32 {
     0
 }
 
-// Translate a Windows system error into a UV error code
-fn uv_translate_sys_error(err: u32) -> i32 {
+// Callback function for RegisterWaitForSingleObject
+unsafe extern "system" fn exit_wait_callback(data: *mut c_void, _timer_fired: u8) {
+    let process = &mut *(data as *mut uv_process);
+
+    eprintln!("exit_wait_callback");
+
+    assert!(_timer_fired == 0);
+    assert!(!process.exit_cb_pending.load(Ordering::Relaxed));
+
+    process.exit_cb_pending.store(true, Ordering::Relaxed);
+
+    // In a real implementation, this would post a completion to the event loop
+    // POST_COMPLETION_FOR_REQ(loop, &process->exit_req);
+    // For now, we'll directly call the process exit handler as a stub
+    // uv__process_proc_exit(loop, process);
+}
+
+// Process the exit of a child process
+pub fn uv__process_proc_exit(_loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+    let mut exit_code: i64 = 0;
+
+    assert!(process.exit_cb_pending.load(Ordering::Relaxed));
+    process.exit_cb_pending.store(false, Ordering::Relaxed);
+
+    // If we're closing, don't call the exit callback. Just schedule a close
+    // callback.
+    // if (process->flags & UV_HANDLE_CLOSING) {
+    //     uv__want_endgame(loop, (uv_handle_t*) process);
+    //     return;
+    // }
+
+    // Unregister from process notification
+    if process.wait_handle != INVALID_HANDLE_VALUE {
+        unsafe { windows_sys::Win32::System::Threading::UnregisterWait(process.wait_handle) };
+        process.wait_handle = INVALID_HANDLE_VALUE;
+    }
+
+    // Set the handle to inactive: no callbacks will be made after the exit
+    // callback.
+    // uv__handle_stop(process);
+
+    let mut status: u32 = 0;
+    if unsafe {
+        windows_sys::Win32::System::Threading::GetExitCodeProcess(
+            process.process_handle,
+            &mut status,
+        )
+    } != 0
+    {
+        exit_code = status as i64;
+    } else {
+        // Unable to obtain the exit code. This should never happen.
+        exit_code = unsafe { GetLastError() as i64 };
+        exit_code = translate_sys_error(exit_code as u32) as i64;
+    }
+
+    // Fire the exit callback if configured
+    if let Some(exit_cb) = process.exit_cb {
+        exit_cb(
+            process as *const _,
+            exit_code.try_into().unwrap(),
+            process.exit_signal,
+        );
+    }
+}
+
+// Close a process handle
+pub fn uv__process_close(loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+    // Mark handle as closing
+    // uv__handle_closing(process);
+
+    if process.wait_handle != INVALID_HANDLE_VALUE {
+        // This blocks until either the wait was cancelled, or the callback has
+        // completed.
+        let r = unsafe { UnregisterWaitEx(process.wait_handle, INVALID_HANDLE_VALUE) };
+        if r == 0 {
+            // This should never happen, and if it happens, we can't recover...
+            unsafe { uv_fatal_error("UnregisterWaitEx") };
+        }
+
+        process.wait_handle = INVALID_HANDLE_VALUE;
+    }
+
+    if !process.exit_cb_pending.load(Ordering::Relaxed) {
+        // uv__want_endgame(loop, (uv_handle_t*)process);
+    }
+}
+
+// Process endgame (final cleanup)
+pub fn uv__process_endgame(loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+    assert!(!process.exit_cb_pending.load(Ordering::Relaxed));
+    // assert!(process.flags & UV_HANDLE_CLOSING);
+    // assert!(!(process.flags & UV_HANDLE_CLOSED));
+
+    // Clean-up the process handle
+    unsafe { CloseHandle(process.process_handle) };
+
+    // uv__handle_close(process);
+}
+
+// Translate Windows system error to a UV error code
+fn translate_sys_error(err: u32) -> Error {
     // Simplified mapping - in a complete implementation this would map
     // Windows error codes to libuv error codes
-    match err {
-        ERROR_INVALID_PARAMETER => Error::EINVAL as i32,
-        ERROR_ACCESS_DENIED => Error::EACCES as i32,
-        _ => -(err as i32), // Just negate the Windows error code for now
+    match err as u32 {
+        ERROR_INVALID_PARAMETER => Error::EINVAL,
+        ERROR_ACCESS_DENIED => Error::EACCES,
+        ERROR_OUTOFMEMORY => Error::ENOMEM,
+        ERROR_FILE_NOT_FOUND => Error::ESRCH,
+        _ => Error::UNKNOWN, // Default to UNKNOWN for other error codes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    #[test]
+    fn test_quote_cmd_arg() {
+        let cases = [
+            ("hello\"world", r#""hello\"world""#),
+            ("hello\"\"world", r#""hello\"\"world""#),
+            ("hello\\world", "hello\\world"),
+            ("hello\\\\world", "hello\\\\world"),
+            ("hello\\\"world", r#""hello\\\"world""#),
+            ("hello\\\\\"world", r#""hello\\\\\"world""#),
+            ("hello world\\", r#""hello world\\""#),
+        ];
+
+        for (input, expected) in cases {
+            let s = WCString::new(input);
+            let mut out = Vec::new();
+            quote_cmd_arg(s.as_wcstr(), &mut out);
+            let out_s = WCString::from_vec(out);
+            assert_eq!(out_s.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_make_program_args() {
+        let args = vec!["hello", "world"];
+        let verbatim_arguments = false;
+        let result = make_program_args(&args, verbatim_arguments).unwrap();
+        assert_eq!(result, WCString::new("hello world"));
     }
 }

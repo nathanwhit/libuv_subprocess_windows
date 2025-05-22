@@ -1,7 +1,31 @@
-use std::ops::{Index, Range, RangeFrom, RangeTo};
+use std::{
+    fmt,
+    ops::{Index, Range, RangeFrom, RangeTo},
+};
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct WCString {
     buf: Box<[u16]>,
+}
+
+impl fmt::Display for WCString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            String::from_utf16_lossy(&self.buf[..self.buf.len() - 1])
+        )
+    }
+}
+
+impl fmt::Debug for WCString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "\"{}\"",
+            String::from_utf16_lossy(&self.buf[..self.buf.len() - 1])
+        )
+    }
 }
 
 impl WCString {
@@ -34,8 +58,12 @@ impl WCString {
         self.buf.as_ptr()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len_with_nul(&self) -> usize {
         self.buf.len()
+    }
+
+    pub fn len_no_nul(&self) -> usize {
+        self.buf.len() - 1
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u16 {
@@ -44,6 +72,14 @@ impl WCString {
 
     pub fn as_wcstr(&self) -> &WCStr {
         unsafe { WCStr::from_wchars(&self.buf) }
+    }
+
+    pub fn as_slice_with_nul(&self) -> &[u16] {
+        &self.buf[..]
+    }
+
+    pub fn as_slice_no_nul(&self) -> &[u16] {
+        &self.buf[..self.len_no_nul()]
     }
 }
 
@@ -57,19 +93,38 @@ impl WCStr {
     // }
 
     pub fn len(&self) -> usize {
-        self.buf.len() - 1
+        if self.has_nul() { self.buf.len() - 1 } else { self.buf.len() }
     }
 
     pub unsafe fn from_wchars(wchars: &[u16]) -> &WCStr {
         unsafe { &*(wchars as *const [u16] as *const WCStr) }
     }
 
+    pub unsafe fn from_wchars_no_nul(wchars: &[u16]) -> &WCStr {
+        unsafe { &*(wchars as *const [u16] as *const WCStr) }
+    }
+
     pub fn as_ptr(&self) -> *const u16 {
         self.buf.as_ptr()
     }
+    
+    fn has_nul(&self) -> bool {
+        if self.buf.len() == 0 {
+            return false;
+        } else {
+            self.buf[self.buf.len() - 1] == 0
+        }
+    }
 
     pub fn wchars_no_null(&self) -> &[u16] {
-        &self.buf[..self.buf.len() - 1]
+        if self.buf.len() == 0 {
+            return &[];
+        }
+        if self.has_nul() {
+            &self.buf[0..self.buf.len() - 1]
+        }  else {
+            &self.buf
+        }
     }
 }
 
