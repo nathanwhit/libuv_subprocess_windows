@@ -4,7 +4,7 @@ use std::{
     convert::TryInto,
     ffi::{CStr, c_void},
     mem,
-    ops::{BitAnd, BitOr},
+    ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign},
     os::windows::raw::HANDLE as RawHandle,
     ptr::{self, null, null_mut},
     sync::{
@@ -407,6 +407,9 @@ pub struct ChildProcess {
 }
 
 impl ChildProcess {
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
     pub fn try_wait(&mut self) -> Result<Option<i32>, std::io::Error> {
         unsafe {
             match WaitForSingleObject(self.handle, 0) {
@@ -460,11 +463,8 @@ impl uv_process {
         let mut path: Option<&[u16]> = None;
         let mut alloc_path: Option<Vec<u16>> = None;
         let mut env: Option<WCString> = None;
-        let mut cwd: Option<WCString> = None;
         let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
         let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
-        let mut process_flags: u32 = 0;
-        let mut cwd_len: u32 = 0;
 
         // Initialize the process
         // process.exit_cb = options.exit_cb;
@@ -480,7 +480,7 @@ impl uv_process {
 
         eprintln!("making application");
         // Convert file path to UTF-16
-        let mut application = Some(WCString::new(&options.file));
+        let application = Some(WCString::new(&options.file));
 
         // Create command line arguments
         eprintln!("making program args: {application:?}");
@@ -500,16 +500,14 @@ impl uv_process {
 
         eprintln!("made env");
         // Handle current working directory
-        if let Some(cwd_option) = &options.cwd {
+        let cwd = if let Some(cwd_option) = &options.cwd {
             // Explicit cwd
-            cwd = Some(WCString::new(cwd_option));
-            let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
-            cwd_len = unsafe { wcslen(cwd_ptr) as u32 };
+            WCString::new(cwd_option)
         } else {
             // Inherit cwd
             // Get current directory length
             unsafe {
-                cwd_len = windows_sys::Win32::System::Environment::GetCurrentDirectoryW(
+                let cwd_len = windows_sys::Win32::System::Environment::GetCurrentDirectoryW(
                     0,
                     ptr::null_mut(),
                 );
@@ -527,22 +525,26 @@ impl uv_process {
                     return Err(translate_sys_error(GetLastError()));
                 }
 
-                cwd = Some(WCString::from_vec(cwd_buf));
+                WCString::from_vec(cwd_buf)
             }
-        }
+        };
 
         // If cwd is too long, shorten it
-        if cwd_len as usize >= windows_sys::Win32::Foundation::MAX_PATH as usize {
+        let cwd = if cwd.len_no_nul() as usize >= windows_sys::Win32::Foundation::MAX_PATH as usize
+        {
             unsafe {
-                let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
-                let mut short_buf = vec![0u16; cwd_len as usize];
-                cwd_len = GetShortPathNameW(cwd_ptr, short_buf.as_mut_ptr(), cwd_len);
+                let cwd_ptr = cwd.as_ptr();
+                let mut short_buf = vec![0u16; cwd.len_no_nul() as usize];
+                let cwd_len =
+                    GetShortPathNameW(cwd_ptr, short_buf.as_mut_ptr(), cwd.len_no_nul() as u32);
                 if cwd_len == 0 {
                     return Err(translate_sys_error(GetLastError()));
                 }
-                cwd = Some(WCString::from_vec(short_buf));
+                WCString::from_vec(short_buf)
             }
-        }
+        } else {
+            cwd
+        };
 
         eprintln!("made cwd: {cwd:?}");
         // Get PATH environment variable
@@ -598,7 +600,7 @@ impl uv_process {
         eprintln!("made cwd");
         let Some(application_path) = search_path(
             application.as_ref().map(|s| s.as_slice_no_nul()).unwrap(),
-            cwd.as_ref().map(|s| s.as_slice_no_nul()).unwrap(),
+            cwd.as_slice_no_nul(),
             path,
             options.flags,
         ) else {
@@ -622,7 +624,7 @@ impl uv_process {
         startup.lpReserved2 = child_stdio_buffer.into_raw();
 
         // Set up process flags
-        process_flags = CREATE_UNICODE_ENVIRONMENT;
+        let mut process_flags = CREATE_UNICODE_ENVIRONMENT;
 
         // Handle console window visibility
         if (options.flags & uv_process_flags::WindowsHideConsole) != 0
@@ -652,7 +654,8 @@ impl uv_process {
 
         // Handle detached processes
         if (options.flags & uv_process_flags::Detached) != 0 {
-            process_flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED;
+            process_flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+            process_flags |= CREATE_SUSPENDED;
         }
 
         // Create the process
@@ -663,7 +666,7 @@ impl uv_process {
         } else {
             ptr::null()
         };
-        let cwd_ptr = cwd.as_ref().unwrap().as_ptr();
+        let cwd_ptr = cwd.as_ptr();
 
         let create_result = unsafe {
             CreateProcessW(
@@ -802,45 +805,43 @@ pub enum Error {
     UNKNOWN,
 }
 
-impl BitOr for uv_process_flags {
-    type Output = u32;
+macro_rules! impl_bitops {
+    ($t: ty : $other: ty) => {
+        impl_bitops!(@help; $t, $other; out = $other);
+        impl_bitops!(@help; $other, $t; out = $other);
+        impl_bitops!(@help; $t, $t; out = $other);
 
-    fn bitor(self, rhs: Self) -> Self::Output {
-        self as u32 | rhs as u32
-    }
+        impl BitOrAssign<$t> for $other {
+            fn bitor_assign(&mut self, rhs: $t) {
+                *self |= rhs as $other;
+            }
+        }
+        impl BitAndAssign<$t> for $other {
+            fn bitand_assign(&mut self, rhs: $t) {
+                *self &= rhs as $other;
+            }
+        }
+    };
+    (@help; $lhs: ty , $rhs: ty; out = $out: ty) => {
+        impl BitOr<$rhs> for $lhs {
+            type Output = $out;
+            fn bitor(self, rhs: $rhs) -> Self::Output {
+                self as $out | rhs as $out
+            }
+        }
+        impl BitAnd<$rhs> for $lhs {
+            type Output = $out;
+
+            fn bitand(self, rhs: $rhs) -> Self::Output {
+                self as $out & rhs as $out
+            }
+        }
+    };
 }
 
-impl BitOr<u32> for uv_process_flags {
-    type Output = u32;
-
-    fn bitor(self, rhs: u32) -> Self::Output {
-        self as u32 | rhs
-    }
-}
-
-impl BitAnd<u32> for uv_process_flags {
-    type Output = u32;
-
-    fn bitand(self, rhs: u32) -> Self::Output {
-        self as u32 & rhs
-    }
-}
-
-impl BitAnd<uv_process_flags> for u32 {
-    type Output = u32;
-
-    fn bitand(self, rhs: uv_process_flags) -> Self::Output {
-        self & rhs as u32
-    }
-}
-
-impl BitAnd for uv_process_flags {
-    type Output = u32;
-
-    fn bitand(self, rhs: uv_process_flags) -> Self::Output {
-        self as u32 & rhs as u32
-    }
-}
+impl_bitops!(
+    uv_process_flags : u32
+);
 
 #[repr(u32)]
 pub enum uv_process_flags {
@@ -1676,7 +1677,7 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> i32 {
 
 /// Kill a process using its pid
 pub fn uv_kill(pid: i32, signum: i32) -> i32 {
-    let mut process_handle: HANDLE;
+    let process_handle: HANDLE;
     let result: i32;
 
     unsafe {
@@ -1727,74 +1728,8 @@ pub fn uv_process_kill(process: &mut uv_process) -> i32 {
     0
 }
 
-// Callback function for RegisterWaitForSingleObject
-unsafe extern "system" fn exit_wait_callback(data: *mut c_void, _timer_fired: u8) {
-    let process = &mut *(data as *mut uv_process);
-
-    eprintln!("exit_wait_callback");
-
-    assert!(_timer_fired == 0);
-    assert!(!process.exit_cb_pending.load(Ordering::Relaxed));
-
-    process.exit_cb_pending.store(true, Ordering::Relaxed);
-
-    // In a real implementation, this would post a completion to the event loop
-    // POST_COMPLETION_FOR_REQ(loop, &process->exit_req);
-    // For now, we'll directly call the process exit handler as a stub
-    uv__process_proc_exit(process);
-}
-
-// Process the exit of a child process
-pub fn uv__process_proc_exit(process: &mut uv_process) {
-    let mut exit_code: i64 = 0;
-
-    assert!(process.exit_cb_pending.load(Ordering::Relaxed));
-    process.exit_cb_pending.store(false, Ordering::Relaxed);
-
-    // If we're closing, don't call the exit callback. Just schedule a close
-    // callback.
-    // if (process->flags & UV_HANDLE_CLOSING) {
-    //     uv__want_endgame(loop, (uv_handle_t*) process);
-    //     return;
-    // }
-
-    // Unregister from process notification
-    if process.wait_handle != INVALID_HANDLE_VALUE {
-        unsafe { UnregisterWait(process.wait_handle) };
-        process.wait_handle = INVALID_HANDLE_VALUE;
-    }
-
-    // Set the handle to inactive: no callbacks will be made after the exit
-    // callback.
-    // uv__handle_stop(process);
-
-    let mut status: u32 = 0;
-    if unsafe {
-        windows_sys::Win32::System::Threading::GetExitCodeProcess(
-            process.process_handle,
-            &mut status,
-        )
-    } != 0
-    {
-        exit_code = status as i64;
-    } else {
-        // Unable to obtain the exit code. This should never happen.
-        exit_code = unsafe { GetLastError() as i64 };
-        exit_code = translate_sys_error(exit_code as u32) as i64;
-    }
-
-    // Fire the exit callback if configured
-    if let Some(exit_cb) = process.exit_cb {
-        exit_cb(
-            process as *const _,
-            exit_code.try_into().unwrap(),
-            process.exit_signal,
-        );
-    }
-}
-
 // Close a process handle
-pub fn uv__process_close(loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+pub fn uv__process_close(process: &mut uv_process) {
     // Mark handle as closing
     // uv__handle_closing(process);
 
@@ -1804,7 +1739,7 @@ pub fn uv__process_close(loop_handle: &mut uv_loop_t, process: &mut uv_process) 
         let r = unsafe { UnregisterWaitEx(process.wait_handle, INVALID_HANDLE_VALUE) };
         if r == 0 {
             // This should never happen, and if it happens, we can't recover...
-            unsafe { uv_fatal_error("UnregisterWaitEx") };
+            uv_fatal_error("UnregisterWaitEx");
         }
 
         process.wait_handle = INVALID_HANDLE_VALUE;
@@ -1816,7 +1751,7 @@ pub fn uv__process_close(loop_handle: &mut uv_loop_t, process: &mut uv_process) 
 }
 
 // Process endgame (final cleanup)
-pub fn uv__process_endgame(loop_handle: &mut uv_loop_t, process: &mut uv_process) {
+pub fn uv__process_endgame(process: &mut uv_process) {
     assert!(!process.exit_cb_pending.load(Ordering::Relaxed));
     // assert!(process.flags & UV_HANDLE_CLOSING);
     // assert!(!(process.flags & UV_HANDLE_CLOSED));

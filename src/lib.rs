@@ -21,15 +21,17 @@ mod foo {
         args: Vec<String>,
         envs: HashMap<String, String>,
         env_clear: bool,
+        detached: bool,
     }
 
     impl Command {
         pub fn new<S: AsRef<str>>(program: S) -> Self {
             Self {
                 program: program.as_ref().to_string(),
-                args: vec![],
+                args: vec![program.as_ref().to_string()],
                 envs: HashMap::new(),
                 env_clear: false,
+                detached: false,
             }
         }
 
@@ -50,6 +52,11 @@ mod foo {
             self
         }
 
+        pub fn detached(&mut self) -> &mut Self {
+            self.detached = true;
+            self
+        }
+
         pub fn env_clear(&mut self) -> &mut Self {
             self.env_clear = true;
             self.envs.clear();
@@ -57,9 +64,13 @@ mod foo {
         }
 
         pub fn spawn(&mut self) -> Result<ChildProcess, Error> {
+            let mut flags = 0;
+            if self.detached {
+                flags |= uv_process_flags::Detached;
+            }
             uv_process::spawn(&uv_process_options {
                 exit_cb: None,
-                flags: 0,
+                flags,
                 file: Cow::Borrowed(&self.program),
                 args: self
                     .args

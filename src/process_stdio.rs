@@ -105,7 +105,7 @@ unsafe fn uv_stdio_noinherit(buffer: *mut u8) {
 }
 
 pub(crate) unsafe fn uv_stdio_size(buffer: *mut u8) -> u16 {
-    (child_stdio_size(unsafe { child_stdio_count(buffer) }) as u16).min(u16::MAX)
+    child_stdio_size(unsafe { child_stdio_count(buffer) }) as u16
 }
 
 pub(crate) unsafe fn uv_stdio_handle(buffer: *mut u8, fd: i32) -> HANDLE {
@@ -194,7 +194,7 @@ pub enum StdioContainer {
 #[inline(never)]
 pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffer, Error> {
     eprintln!("uv_stdio_create");
-    let mut count = options.stdio_count;
+    let mut count = options.stdio.len();
     if count > 255 {
         return Err(Error::EINVAL);
     } else if count < 3 {
@@ -204,7 +204,7 @@ pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffe
     let mut buffer = StdioBuffer::new(count);
 
     for i in 0..count {
-        let fdopt = if i < options.stdio_count {
+        let fdopt = if i < options.stdio.len() {
             options.stdio[i]
         } else {
             StdioContainer::Ignore

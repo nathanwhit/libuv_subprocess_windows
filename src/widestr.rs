@@ -93,7 +93,11 @@ impl WCStr {
     // }
 
     pub fn len(&self) -> usize {
-        if self.has_nul() { self.buf.len() - 1 } else { self.buf.len() }
+        if self.has_nul() {
+            self.buf.len() - 1
+        } else {
+            self.buf.len()
+        }
     }
 
     pub unsafe fn from_wchars(wchars: &[u16]) -> &WCStr {
@@ -107,7 +111,7 @@ impl WCStr {
     pub fn as_ptr(&self) -> *const u16 {
         self.buf.as_ptr()
     }
-    
+
     fn has_nul(&self) -> bool {
         if self.buf.is_empty() {
             false
@@ -122,7 +126,7 @@ impl WCStr {
         }
         if self.has_nul() {
             &self.buf[0..self.buf.len() - 1]
-        }  else {
+        } else {
             &self.buf
         }
     }

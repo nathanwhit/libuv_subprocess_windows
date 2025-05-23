@@ -1,8 +1,8 @@
-import { spawn } from "node:child_process";
+let i = 0;
+const interval = setInterval(() => {
+  Deno.writeTextFileSync("foo.txt", `Hello, world! ${i++}`);
+}, 1000);
 
-const child = spawn("deno.exe", ["eval", "console.log('Hello, world!');"], {
-  stdio: "inherit",
-});
-child.on("exit", () => {
-  console.log("exited");
-});
+setTimeout(() => {
+  clearInterval(interval);
+}, 15000);
