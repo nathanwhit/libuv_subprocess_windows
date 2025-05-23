@@ -109,15 +109,15 @@ impl WCStr {
     }
     
     fn has_nul(&self) -> bool {
-        if self.buf.len() == 0 {
-            return false;
+        if self.buf.is_empty() {
+            false
         } else {
             self.buf[self.buf.len() - 1] == 0
         }
     }
 
     pub fn wchars_no_null(&self) -> &[u16] {
-        if self.buf.len() == 0 {
+        if self.buf.is_empty() {
             return &[];
         }
         if self.has_nul() {
