@@ -169,12 +169,13 @@ mod foo {
             };
             let (stdout, child_stdout) = match self.stdout {
                 Stdio::Pipe => {
-                    let (r, w) = std::io::pipe()?;
+                    let pipes = crate::anon_pipe::anon_pipe(true, true)?;
+                    let child_stdout_handle = pipes.ours.into_handle();
+                    let stdout_handle = pipes.theirs.into_handle().into_raw_handle();
+
                     (
-                        StdioContainer::RawHandle(w.into_raw_handle()),
-                        Some(ChildStdout::from(unsafe {
-                            OwnedHandle::from_raw_handle(r.into_raw_handle())
-                        })),
+                        StdioContainer::RawHandle(stdout_handle),
+                        Some(ChildStdout::from(child_stdout_handle)),
                     )
                 }
                 Stdio::Null => (StdioContainer::Ignore, None),
@@ -182,12 +183,13 @@ mod foo {
             };
             let (stderr, child_stderr) = match self.stderr {
                 Stdio::Pipe => {
-                    let (r, w) = std::io::pipe()?;
+                    let pipes = crate::anon_pipe::anon_pipe(true, true)?;
+                    let child_stderr_handle = pipes.ours.into_handle();
+                    let stderr_handle = pipes.theirs.into_handle().into_raw_handle();
+
                     (
-                        StdioContainer::RawHandle(w.into_raw_handle()),
-                        Some(ChildStderr::from(unsafe {
-                            OwnedHandle::from_raw_handle(r.into_raw_handle())
-                        })),
+                        StdioContainer::RawHandle(stderr_handle),
+                        Some(ChildStderr::from(child_stderr_handle)),
                     )
                 }
                 Stdio::Null => (StdioContainer::Ignore, None),

@@ -9,9 +9,6 @@ const pth = (...args: string[]) => join(root, ...args);
 
 const cargoTOMLData = TOML.parse(Deno.readTextFileSync(pth("Cargo.toml")));
 
-const deps = cargoTOMLData.target["x86_64-pc-windows-gnu"].dependencies;
-const feats = deps["windows-sys"].features;
-
 const args = parseArgs(Deno.args, {
   boolean: ["split"],
   alias: {
