@@ -4,5 +4,8 @@
     "cp-remote": "scp target/x86_64-pc-windows-gnu/debug/libuv-subprocess-windows.exe nwhit@192.168.0.24:\"D:\\Work\\libuv-subprocess-windows.exe\"",
     "runsan": "RUSTFLAGS=-Zsanitizer=address cargo +nightly r"
   },
-  "lock": false
+  "lock": false,
+  "imports": {
+    "@types/node": "npm:@types/node@^22.15.21"
+  }
 }

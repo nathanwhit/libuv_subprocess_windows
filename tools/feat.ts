@@ -32,15 +32,19 @@ if (Deno.args.length === 0) {
   Deno.exit(1);
 }
 
-const featsToAdd = processedArgs.map((feat) => feat.trim()).filter(
-  (feat) => feat.length > 0 && !feats.includes(feat),
-);
+for (const depTarget of ["x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc"]) {
+  const deps = cargoTOMLData.target[depTarget].dependencies;
+  const feats = deps["windows-sys"].features;
+  const featsToAdd = processedArgs.map((feat) => feat.trim()).filter(
+    (feat) => feat.length > 0 && !feats.includes(feat),
+  );
 
-if (featsToAdd.length === 0) {
-  console.error("Features already included");
-  Deno.exit(0);
+  if (featsToAdd.length === 0) {
+    console.error(`Features already included for ${depTarget}`);
+    continue;
+  }
+
+  feats.push(...featsToAdd);
 }
-
-feats.push(...featsToAdd);
 
 Deno.writeTextFileSync(pth("Cargo.toml"), TOML.stringify(cargoTOMLData));

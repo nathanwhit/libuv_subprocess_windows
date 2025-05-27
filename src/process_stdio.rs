@@ -18,13 +18,13 @@ use windows_sys::Win32::{
 use crate::process::{Error, uv_process_options};
 
 const FOPEN: u8 = 0x01;
-const FEOFLAG: u8 = 0x02;
-const FCRLF: u8 = 0x04;
+// const FEOFLAG: u8 = 0x02;
+// const FCRLF: u8 = 0x04;
 const FPIPE: u8 = 0x08;
-const FNOINHERIT: u8 = 0x10;
-const FAPPEND: u8 = 0x20;
+// const FNOINHERIT: u8 = 0x10;
+// const FAPPEND: u8 = 0x20;
 const FDEV: u8 = 0x40;
-const FTEXT: u8 = 0x80;
+// const FTEXT: u8 = 0x80;
 
 const fn child_stdio_size(count: usize) -> usize {
     (size_of::<c_int>() + size_of::<u8>() * count + size_of::<usize>() * count) as usize
@@ -47,6 +47,7 @@ unsafe fn child_stdio_crt_flags(buffer: *mut u8, fd: i32) -> *mut u8 {
     unsafe { buffer.add(size_of::<c_int>() + fd as usize) }.cast()
 }
 
+#[allow(dead_code)]
 unsafe fn uv_stdio_verify(buffer: *mut u8, size: u16) -> bool {
     if buffer.is_null() {
         return false;
@@ -94,6 +95,7 @@ fn uv_create_nul_handle(access: u32) -> Result<HANDLE, Error> {
     Ok(handle)
 }
 
+#[allow(dead_code)]
 unsafe fn uv_stdio_noinherit(buffer: *mut u8) {
     let count = unsafe { child_stdio_count(buffer) };
     for i in 0..count {
@@ -102,10 +104,6 @@ unsafe fn uv_stdio_noinherit(buffer: *mut u8) {
             unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
         }
     }
-}
-
-pub(crate) unsafe fn uv_stdio_size(buffer: *mut u8) -> u16 {
-    child_stdio_size(unsafe { child_stdio_count(buffer) }) as u16
 }
 
 pub(crate) unsafe fn uv_stdio_handle(buffer: *mut u8, fd: i32) -> HANDLE {
@@ -121,7 +119,7 @@ pub(crate) unsafe fn uv_stdio_handle(buffer: *mut u8, fd: i32) -> HANDLE {
     handle
 }
 
-unsafe fn uv_duplicate_handle(handle: HANDLE) -> Result<HANDLE, Error> {
+pub unsafe fn uv_duplicate_handle(handle: HANDLE) -> Result<HANDLE, Error> {
     if handle == INVALID_HANDLE_VALUE
         || handle == null_mut()
         || handle == ((-2i32) as usize as HANDLE)
@@ -189,11 +187,11 @@ unsafe fn copy_handle(mut handle: HANDLE, dest: *mut HANDLE) {
 pub enum StdioContainer {
     Ignore,
     InheritFd(i32),
+    RawHandle(HANDLE),
 }
 
 #[inline(never)]
 pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffer, Error> {
-    eprintln!("uv_stdio_create");
     let mut count = options.stdio.len();
     if count > 255 {
         return Err(Error::EINVAL);
@@ -211,6 +209,11 @@ pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffe
         };
 
         match fdopt {
+            StdioContainer::RawHandle(handle) => {
+                unsafe { buffer.set_handle(i as i32, handle) };
+                let flags = unsafe { handle_file_type_flags(handle)? };
+                unsafe { buffer.set_flags(i as i32, flags) };
+            }
             StdioContainer::Ignore => unsafe {
                 if i <= 2 {
                     let access = if i == 0 {
@@ -235,28 +238,30 @@ pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffe
                     Err(e) => return Err(e),
                 };
 
-                match unsafe { GetFileType(handle) } {
-                    FILE_TYPE_DISK => unsafe { buffer.set_flags(fd, FOPEN) },
-                    FILE_TYPE_PIPE => unsafe { buffer.set_flags(fd, FOPEN | FPIPE) },
-                    FILE_TYPE_CHAR | FILE_TYPE_REMOTE => unsafe {
-                        buffer.set_flags(fd, FOPEN | FDEV)
-                    },
-                    FILE_TYPE_UNKNOWN => {
-                        if unsafe { GetLastError() } != 0 {
-                            unsafe { CloseHandle(handle) };
-                            return Err(Error::UNKNOWN);
-                        }
-                        unsafe { buffer.set_flags(fd, FOPEN | FDEV) }
-                    }
-                    other => panic!("Unknown file type: {}", other),
-                }
-
-                unsafe { buffer.set_handle(fd, handle) }
+                let flags = unsafe { handle_file_type_flags(handle)? };
+                unsafe { buffer.set_handle(fd, handle) };
+                unsafe { buffer.set_flags(fd, flags) };
             }
         }
     }
 
     Ok(buffer)
+}
+
+unsafe fn handle_file_type_flags(handle: HANDLE) -> Result<u8, Error> {
+    Ok(match unsafe { GetFileType(handle) } {
+        FILE_TYPE_DISK => FOPEN,
+        FILE_TYPE_PIPE => FOPEN | FPIPE,
+        FILE_TYPE_CHAR | FILE_TYPE_REMOTE => FOPEN | FDEV,
+        FILE_TYPE_UNKNOWN => {
+            if unsafe { GetLastError() } != 0 {
+                unsafe { CloseHandle(handle) };
+                return Err(Error::UNKNOWN);
+            }
+            FOPEN | FDEV
+        }
+        other => panic!("Unknown file type: {}", other),
+    })
 }
 
 mod buffer {
@@ -282,7 +287,6 @@ mod buffer {
                     self.ptr as *mut _,
                     std::alloc::Layout::array::<u8>(self.get_count()).unwrap(),
                 );
-                eprintln!("Dropped stdio buffer");
             }
         }
     }
@@ -306,7 +310,6 @@ mod buffer {
         }
         pub fn new(count: usize) -> Self {
             let buffer = Self::create_raw(count);
-            eprintln!("CREATING WITH COUNT: {}", count);
 
             unsafe {
                 *buffer.ptr.cast::<std::ffi::c_uint>() = count as std::ffi::c_uint;

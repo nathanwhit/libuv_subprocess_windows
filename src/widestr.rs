@@ -58,24 +58,13 @@ impl WCString {
         self.buf.as_ptr()
     }
 
-    pub fn len_with_nul(&self) -> usize {
-        self.buf.len()
-    }
-
     pub fn len_no_nul(&self) -> usize {
         self.buf.len() - 1
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u16 {
-        self.buf.as_mut_ptr()
-    }
-
+    #[allow(dead_code)]
     pub fn as_wcstr(&self) -> &WCStr {
         unsafe { WCStr::from_wchars(&self.buf) }
-    }
-
-    pub fn as_slice_with_nul(&self) -> &[u16] {
-        &self.buf[..]
     }
 
     pub fn as_slice_no_nul(&self) -> &[u16] {
@@ -101,10 +90,6 @@ impl WCStr {
     }
 
     pub unsafe fn from_wchars(wchars: &[u16]) -> &WCStr {
-        unsafe { &*(wchars as *const [u16] as *const WCStr) }
-    }
-
-    pub unsafe fn from_wchars_no_nul(wchars: &[u16]) -> &WCStr {
         unsafe { &*(wchars as *const [u16] as *const WCStr) }
     }
 
