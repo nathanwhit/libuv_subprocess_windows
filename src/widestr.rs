@@ -1,6 +1,8 @@
 use std::{
+    ffi::OsStr,
     fmt,
     ops::{Index, Range, RangeFrom, RangeTo},
+    os::windows::ffi::OsStrExt,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -29,12 +31,8 @@ impl fmt::Debug for WCString {
 }
 
 impl WCString {
-    pub fn new(s: &str) -> Self {
-        let mut buf = Vec::with_capacity(s.len());
-        for c in s.encode_utf16() {
-            buf.push(c);
-        }
-        buf.push(0);
+    pub fn new<T: AsRef<OsStr>>(s: T) -> Self {
+        let buf = s.as_ref().encode_wide().chain(Some(0)).collect::<Vec<_>>();
         Self {
             buf: buf.into_boxed_slice(),
         }

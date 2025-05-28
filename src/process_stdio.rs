@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     System::Threading::GetCurrentProcess,
 };
 
-use crate::process::{Error, uv_process_options};
+use crate::process::{Error, SpawnOptions};
 
 const FOPEN: u8 = 0x01;
 // const FEOFLAG: u8 = 0x02;
@@ -191,7 +191,7 @@ pub enum StdioContainer {
 }
 
 #[inline(never)]
-pub(crate) fn uv_stdio_create(options: &uv_process_options) -> Result<StdioBuffer, Error> {
+pub(crate) fn uv_stdio_create(options: &SpawnOptions) -> Result<StdioBuffer, Error> {
     let mut count = options.stdio.len();
     if count > 255 {
         return Err(Error::EINVAL);
@@ -265,6 +265,8 @@ unsafe fn handle_file_type_flags(handle: HANDLE) -> Result<u8, Error> {
 }
 
 mod buffer {
+    use std::{ffi::c_uint, mem::ManuallyDrop};
+
     use super::*;
     #[repr(transparent)]
     pub struct StdioBuffer {
@@ -292,14 +294,15 @@ mod buffer {
     }
 
     impl StdioBuffer {
+        /// # Safety
+        /// The buffer pointer must be valid and point to memory allocated by
+        /// `std::alloc::alloc`.
         pub unsafe fn from_raw(ptr: *mut u8) -> Self {
             Self { ptr }
         }
 
         pub fn into_raw(self) -> *mut u8 {
-            let ptr = self.ptr;
-            std::mem::forget(self);
-            ptr
+            ManuallyDrop::new(self).ptr
         }
 
         fn create_raw(count: usize) -> Self {
@@ -311,11 +314,15 @@ mod buffer {
         pub fn new(count: usize) -> Self {
             let buffer = Self::create_raw(count);
 
+            // SAFETY: Since the buffer is uninitialized, use raw pointers
+            // and do not read the data.
             unsafe {
-                *buffer.ptr.cast::<std::ffi::c_uint>() = count as std::ffi::c_uint;
+                std::ptr::write(buffer.ptr.cast::<c_uint>(), count as c_uint);
             }
 
             for i in 0..count {
+                // SAFETY: We initialized a big enough buffer for `count`
+                // handles, so `i` is within bounds.
                 unsafe {
                     copy_handle(
                         INVALID_HANDLE_VALUE,
@@ -332,10 +339,18 @@ mod buffer {
             unsafe { child_stdio_count(self.ptr) }
         }
 
+        /// # Safety
+        ///
+        /// This function does not check that the fd is within the bounds
+        /// of the buffer.
         pub unsafe fn get_handle(&self, fd: i32) -> HANDLE {
             unsafe { uv_stdio_handle(self.ptr, fd) }
         }
 
+        /// # Safety
+        ///
+        /// This function does not check that the fd is within the bounds
+        /// of the buffer.
         pub unsafe fn set_flags(&mut self, fd: i32, flags: u8) {
             debug_assert!(fd < unsafe { child_stdio_count(self.ptr) } as i32,);
             unsafe {
@@ -343,6 +358,10 @@ mod buffer {
             }
         }
 
+        /// # Safety
+        ///
+        /// This function does not check that the fd is within the bounds
+        /// of the buffer.
         pub unsafe fn set_handle(&mut self, fd: i32, handle: HANDLE) {
             unsafe {
                 copy_handle(handle, child_stdio_handle(self.ptr, fd).cast());

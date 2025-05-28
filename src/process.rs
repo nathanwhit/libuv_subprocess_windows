@@ -1,10 +1,13 @@
 #![allow(nonstandard_style, dead_code)]
 use std::{
     borrow::Cow,
-    ffi::{CStr, c_void},
+    ffi::{CStr, OsStr, c_void},
     mem,
     ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     ptr::{self, null, null_mut},
     sync::OnceLock,
 };
@@ -254,13 +257,13 @@ struct Waiting {
 unsafe impl Sync for Waiting {}
 unsafe impl Send for Waiting {}
 
-pub struct uv_process_options<'a> {
+pub struct SpawnOptions<'a> {
     // pub exit_cb: Option<fn(*const uv_process, u64, i32)>,
     pub flags: u32,
-    pub file: Cow<'a, str>,
-    pub args: Vec<Cow<'a, str>>,
-    pub env: Option<Vec<Cow<'a, str>>>,
-    pub cwd: Option<Cow<'a, str>>,
+    pub file: Cow<'a, OsStr>,
+    pub args: Vec<Cow<'a, OsStr>>,
+    pub env: Option<Vec<Cow<'a, OsStr>>>,
+    pub cwd: Option<Cow<'a, OsStr>>,
     pub stdio: Vec<super::process_stdio::StdioContainer>,
 }
 
@@ -342,13 +345,13 @@ fn quote_cmd_arg(src: &WCStr, target: &mut Vec<u16>) {
     target.push(wchar!('"'));
 }
 
-fn make_program_args(args: &[&str], verbatim_arguments: bool) -> Result<WCString, Error> {
+fn make_program_args(args: &[&OsStr], verbatim_arguments: bool) -> Result<WCString, Error> {
     let mut dst_len = 0;
     let mut temp_buffer_len = 0;
 
     // Count the required size.
     for arg in args {
-        let arg_len = arg.chars().map(|c| c.len_utf16()).sum::<usize>();
+        let arg_len = arg.encode_wide().count();
         dst_len += arg_len;
         if arg_len > temp_buffer_len {
             temp_buffer_len = arg_len;
@@ -364,7 +367,7 @@ fn make_program_args(args: &[&str], verbatim_arguments: bool) -> Result<WCString
 
     for (i, arg) in args.iter().enumerate() {
         temp_buffer.clear();
-        temp_buffer.extend(arg.encode_utf16());
+        temp_buffer.extend(arg.encode_wide());
 
         if verbatim_arguments {
             dst.extend(temp_buffer.as_slice());
@@ -434,18 +437,11 @@ impl ChildProcess {
     }
 }
 
-pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
-    // let mut process = Self::init(ptr::null_mut());
-    let mut path: Option<&[u16]> = None;
-    let mut alloc_path: Option<Vec<u16>> = None;
+pub fn spawn(options: &SpawnOptions) -> Result<ChildProcess, Error> {
     let mut env: Option<WCString> = None;
     let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
     let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
 
-    // Initialize the process
-    // process.exit_cb = options.exit_cb;
-
-    // Validate options
     if options.flags & (uv_process_flags::SetUid | uv_process_flags::SetGid) != 0 {
         return Err(Error::ENOTSUP);
     }
@@ -458,13 +454,13 @@ pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
     let application = Some(WCString::new(&options.file));
 
     // Create command line arguments
-    let args: Vec<&str> = options.args.iter().map(|s| s.as_ref()).collect();
+    let args: Vec<&OsStr> = options.args.iter().map(|s| s.as_ref()).collect();
     let verbatim_arguments = (options.flags & uv_process_flags::WindowsVerbatimArguments) != 0;
     let arguments = make_program_args(&args, verbatim_arguments)?;
 
     // Create environment block if provided
     if let Some(env_block) = &options.env {
-        let env_strs: Vec<&str> = env_block.iter().map(|s| s.as_ref()).collect();
+        let env_strs: Vec<&OsStr> = env_block.iter().map(|s| s.as_ref()).collect();
         env = match make_program_env(Some(&env_strs)) {
             Ok(env_block) => Some(env_block),
             Err(e) => return Err(e),
@@ -477,26 +473,8 @@ pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
         WCString::new(cwd_option)
     } else {
         // Inherit cwd
-        // Get current directory length
-        unsafe {
-            let cwd_len =
-                windows_sys::Win32::System::Environment::GetCurrentDirectoryW(0, ptr::null_mut());
-            if cwd_len == 0 {
-                return Err(translate_sys_error(GetLastError()));
-            }
-
-            // Allocate buffer for current directory
-            let mut cwd_buf = vec![0u16; cwd_len as usize];
-            let r = windows_sys::Win32::System::Environment::GetCurrentDirectoryW(
-                cwd_len,
-                cwd_buf.as_mut_ptr(),
-            );
-            if r == 0 || r >= cwd_len {
-                return Err(translate_sys_error(GetLastError()));
-            }
-
-            WCString::from_vec(cwd_buf)
-        }
+        let cwd = std::env::current_dir().unwrap();
+        WCString::new(cwd)
     };
 
     // If cwd is too long, shorten it
@@ -516,39 +494,18 @@ pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
     };
 
     // Get PATH environment variable
-    if let Some(env_ref) = &env {
+    let path = if let Some(env_ref) = &env {
         // Try to find PATH in the provided environment block
-        let env_ptr = env_ref.as_ptr();
-        let env_slice = unsafe {
-            let len = wcslen(env_ptr);
-            std::slice::from_raw_parts(env_ptr, len)
-        };
-        path = find_path(env_slice);
-    }
+        find_path(env_ref.as_slice_no_nul())
+    } else {
+        None
+    };
 
-    if path.is_none() {
+    let path = path.map(|p| Some(Cow::Borrowed(p))).unwrap_or_else(|| {
         // PATH not found in provided environment, get system PATH
-        unsafe {
-            let path_len = windows_sys::Win32::System::Environment::GetEnvironmentVariableW(
-                w!("PATH"),
-                ptr::null_mut(),
-                0,
-            );
-            if path_len != 0 {
-                let mut path_buf = vec![0u16; path_len as usize];
-                let r = windows_sys::Win32::System::Environment::GetEnvironmentVariableW(
-                    w!("PATH"),
-                    path_buf.as_mut_ptr(),
-                    path_len,
-                );
-                if r == 0 || r >= path_len {
-                    return Err(translate_sys_error(GetLastError()));
-                }
-                alloc_path = Some(path_buf);
-                path = Some(&alloc_path.as_ref().unwrap()[..]);
-            }
-        }
-    }
+        let path = std::env::var_os("PATH")?;
+        Some(Cow::Owned(path.encode_wide().chain(Some(0)).collect()))
+    });
 
     // Create and set up stdio
     let child_stdio_buffer = uv_stdio_create(options)?;
@@ -557,7 +514,7 @@ pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
     let Some(application_path) = search_path(
         application.as_ref().map(|s| s.as_slice_no_nul()).unwrap(),
         cwd.as_slice_no_nul(),
-        path,
+        path.as_deref(),
         options.flags,
     ) else {
         return Err(translate_sys_error(ERROR_FILE_NOT_FOUND));
@@ -682,52 +639,10 @@ pub fn spawn(options: &uv_process_options) -> Result<ChildProcess, Error> {
         waiting: None,
     };
 
-    // Set IPC pid to all IPC pipes (stubbed for now)
-    // for i in 0..options.stdio_count {
-    //     let fdopt = &options.stdio[i];
-    //     if fdopt.flags & UV_CREATE_PIPE != 0 &&
-    //        fdopt.data.stream.type == UV_NAMED_PIPE &&
-    //        ((uv_pipe_t*) fdopt.data.stream).ipc {
-    //        ((uv_pipe_t*) fdopt.data.stream).pipe.conn.ipc_remote_pid = info.dwProcessId;
-    //     }
-    // }
-
-    // eprintln!("RegisterWaitForSingleObject");
-    // // Setup notifications for when the child process exits
-    // let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = ptr::null_mut();
-    // let result = unsafe {
-    //     windows_sys::Win32::System::Threading::RegisterWaitForSingleObject(
-    //         &mut wait_handle,
-    //         child.handle,
-    //         Some(exit_wait_callback),
-    //         &mut child.waiting as *mut _ as *mut _,
-    //         u32::MAX, // INFINITE
-    //         windows_sys::Win32::System::Threading::WT_EXECUTEINWAITTHREAD
-    //             | windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
-    //     )
-    // };
-
-    // if result == 0 {
-    //     uv_fatal_error("RegisterWaitForSingleObject")
-    // }
-    // eprintln!("RegisterWaitForSingleObject done");
-
-    // self.wait_handle = wait_handle;
-
     // Close the thread handle as we don't need it
     unsafe { windows_sys::Win32::Foundation::CloseHandle(info.hThread) };
 
-    drop(application);
-    drop(application_path);
-    drop(arguments);
-    drop(cwd);
-    drop(env);
-    drop(alloc_path);
-
     if !startup.lpReserved2.is_null() {
-        // Mark handle as active
-        // In a real implementation, this would be done via uv__handle_start(process)
-        // For now, we'll consider it active
         unsafe { free_stdio_buffer(startup.lpReserved2) };
     }
 
@@ -964,8 +879,6 @@ fn search_path_walk_ext(
 /// Otherwise, it will use `na-1` as the length to compare.
 ///
 /// Returns negative if a < b, positive if a > b, 0 if they are equal.
-///
-/// This is a Rust translation of the original env_strncmp C function.
 fn env_strncmp(a: &[u16], na: isize, b: &[u16]) -> i32 {
     use windows_sys::Win32::Globalization::CSTR_EQUAL;
     use windows_sys::Win32::Globalization::CompareStringOrdinal;
@@ -1016,8 +929,6 @@ fn env_strncmp(a: &[u16], na: isize, b: &[u16]) -> i32 {
 ///
 /// This passes a -1 for `na` to env_strncmp, which will make it find the equals sign
 /// in the first string.
-///
-/// This is a Rust translation of the original qsort_wcscmp C function.
 fn qsort_wcscmp(a: &[u16], b: &[u16]) -> i32 {
     env_strncmp(a, -1, b)
 }
@@ -1029,8 +940,6 @@ fn qsort_wcscmp(a: &[u16], b: &[u16]) -> i32 {
 /// looking for the PATH entry and returns the value portion (after the equals sign).
 ///
 /// Returns None if no PATH is found.
-///
-/// This is a Rust translation of the original find_path C function.
 fn find_path(env: &[u16]) -> Option<&[u16]> {
     let mut current = 0;
 
@@ -1074,9 +983,7 @@ fn find_path(env: &[u16]) -> Option<&[u16]> {
 ///
 /// Also add variables known to Cygwin to be required for correct
 /// subprocess operation in many cases.
-///
-/// This is a Rust translation of the original make_program_env function.
-fn make_program_env(env_block: Option<&[&str]>) -> Result<WCString, Error> {
+fn make_program_env(env_block: Option<&[&OsStr]>) -> Result<WCString, Error> {
     // If env_block is None, we'll just generate the environment with required variables
     let env_block = env_block.unwrap_or(&[]);
     let mut env_len = 0;
@@ -1084,9 +991,9 @@ fn make_program_env(env_block: Option<&[&str]>) -> Result<WCString, Error> {
     // First pass: determine size in UTF-16
     let mut env_copy = Vec::new();
     for env in env_block {
-        if env.contains('=') {
+        if env.as_encoded_bytes().contains(&b'=') {
             // Convert to UTF-16 and add to our collection
-            let mut utf16 = env.encode_utf16().collect::<Vec<u16>>();
+            let mut utf16 = env.encode_wide().collect::<Vec<u16>>();
             utf16.push(0); // Null terminate
             env_len += utf16.len();
             env_copy.push(utf16);
@@ -1747,19 +1654,23 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            let s = WCString::new(input);
+            let s = input.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let s = WCString::from_vec(s);
             let mut out = Vec::new();
             quote_cmd_arg(s.as_wcstr(), &mut out);
-            let out_s = WCString::from_vec(out);
-            assert_eq!(out_s.to_string(), expected);
+            let out_s = String::from_utf16_lossy(&out);
+            assert_eq!(out_s, expected);
         }
     }
 
     #[test]
     fn test_make_program_args() {
-        let args = vec!["hello", "world"];
+        let args = ["hello", "world", "\"hello world\""]
+            .into_iter()
+            .map(|s| s.as_ref())
+            .collect::<Vec<_>>();
         let verbatim_arguments = false;
         let result = make_program_args(&args, verbatim_arguments).unwrap();
-        assert_eq!(result, WCString::new("hello world"));
+        assert_eq!(result, WCString::new("hello world \"\\\"hello world\\\"\""));
     }
 }
