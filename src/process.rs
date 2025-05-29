@@ -2,24 +2,26 @@
 use std::{
     borrow::Cow,
     ffi::{CStr, OsStr, c_void},
-    mem,
+    io, mem,
     ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign},
     os::windows::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
+    pin::Pin,
     ptr::{self, null, null_mut},
     sync::OnceLock,
+    task::Poll,
 };
 
 use futures_channel::oneshot;
 use windows_sys::{
     Win32::{
         Foundation::{
-            BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-            ERROR_OUTOFMEMORY, ERROR_SUCCESS, FALSE, GENERIC_WRITE, GetLastError, HANDLE,
-            INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            BOOL, BOOLEAN, CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+            ERROR_INVALID_PARAMETER, ERROR_OUTOFMEMORY, ERROR_SUCCESS, FALSE, GENERIC_WRITE,
+            GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, TRUE, WAIT_FAILED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Globalization::GetSystemDefaultLangID,
         Security::SECURITY_ATTRIBUTES,
@@ -46,8 +48,9 @@ use windows_sys::{
                 CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
                 CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, GetCurrentProcess,
                 GetExitCodeProcess, GetProcessId, INFINITE, OpenProcess, PROCESS_INFORMATION,
-                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, ResumeThread, STARTF_USESHOWWINDOW,
-                STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, RegisterWaitForSingleObject,
+                ResumeThread, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
+                TerminateProcess, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE, WaitForSingleObject,
             },
         },
         UI::{
@@ -248,6 +251,7 @@ impl uv_loop_t {
 //     waiting: Option<Waiting>,
 // }
 
+#[derive(Debug)]
 struct Waiting {
     rx: oneshot::Receiver<()>,
     wait_object: HANDLE,
@@ -394,12 +398,20 @@ fn cvt(result: BOOL) -> Result<(), std::io::Error> {
     }
 }
 
+#[derive(Debug)]
 pub struct ChildProcess {
     pid: i32,
     exit_signal: Option<i32>,
     exit_code: Option<i64>,
     handle: OwnedHandle,
     waiting: Option<Waiting>,
+}
+
+impl crate::Kill for ChildProcess {
+    fn kill(&mut self) -> std::io::Result<()> {
+        process_kill(self.pid, SIGTERM)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    }
 }
 
 impl ChildProcess {
@@ -433,6 +445,60 @@ impl ChildProcess {
             let mut status = 0;
             cvt(GetExitCodeProcess(self.handle.as_raw_handle(), &mut status))?;
             Ok(status as i32)
+        }
+    }
+}
+
+unsafe extern "system" fn callback(ptr: *mut std::ffi::c_void, _timer_fired: BOOLEAN) {
+    let complete = unsafe { &mut *(ptr as *mut Option<oneshot::Sender<()>>) };
+    let _ = complete.take().unwrap().send(());
+}
+
+impl Future for ChildProcess {
+    type Output = Result<i32, std::io::Error>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = Pin::get_mut(self);
+        loop {
+            if let Some(ref mut w) = inner.waiting {
+                match Pin::new(&mut w.rx).poll(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(_)) => panic!("should not be canceled"),
+                    Poll::Pending => return Poll::Pending,
+                }
+                let status = inner.try_wait()?.expect("not ready yet");
+                return Poll::Ready(Ok(status));
+            }
+
+            if let Some(e) = inner.try_wait()? {
+                return Poll::Ready(Ok(e));
+            }
+            let (tx, rx) = oneshot::channel();
+            let ptr = Box::into_raw(Box::new(Some(tx)));
+            let mut wait_object = null_mut();
+            let rc = unsafe {
+                RegisterWaitForSingleObject(
+                    &mut wait_object,
+                    inner.handle.as_raw_handle() as _,
+                    Some(callback),
+                    ptr as *mut _,
+                    INFINITE,
+                    WT_EXECUTEINWAITTHREAD | WT_EXECUTEONLYONCE,
+                )
+            };
+            if rc == 0 {
+                let err = io::Error::last_os_error();
+                drop(unsafe { Box::from_raw(ptr) });
+                return Poll::Ready(Err(err));
+            }
+            inner.waiting = Some(Waiting {
+                rx,
+                wait_object,
+                tx: ptr,
+            });
         }
     }
 }

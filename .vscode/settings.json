@@ -3,5 +3,6 @@
   "deno.enable": true,
   "clangd.arguments": [
     "--compile-commands=${workspaceFolder}/libuv/build/compile_commands.json"
-  ]
+  ],
+  "git.enabled": false
 }

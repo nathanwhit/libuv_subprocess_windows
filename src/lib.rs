@@ -7,8 +7,19 @@ mod widestr;
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::io;
+use std::io::Read;
+use std::os::windows::io::FromRawHandle;
+use std::os::windows::process::ExitStatusExt;
+use std::path::Path;
+use std::pin::Pin;
+use std::process::ExitStatus;
+use std::process::Output;
+use std::task::Context;
+use std::task::Poll;
 
 pub use anon_pipe::handle_dup;
+use anon_pipe::read2;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -25,6 +36,7 @@ pub enum Stdio {
     Inherit,
     Pipe,
     Null,
+    RawHandle(HANDLE),
 }
 
 impl From<Stdio> for std::process::Stdio {
@@ -33,28 +45,186 @@ impl From<Stdio> for std::process::Stdio {
             Stdio::Inherit => std::process::Stdio::inherit(),
             Stdio::Pipe => std::process::Stdio::piped(),
             Stdio::Null => std::process::Stdio::null(),
+            Stdio::RawHandle(handle) => unsafe { std::process::Stdio::from_raw_handle(handle) },
         }
     }
 }
 
+impl Stdio {
+    pub fn inherit() -> Self {
+        Stdio::Inherit
+    }
+
+    pub fn piped() -> Self {
+        Stdio::Pipe
+    }
+
+    pub fn null() -> Self {
+        Stdio::Null
+    }
+}
+
+impl<T: IntoRawHandle> From<T> for Stdio {
+    fn from(value: T) -> Self {
+        Stdio::RawHandle(value.into_raw_handle())
+    }
+}
+
 pub struct Child {
-    process: ChildProcess,
+    inner: FusedChild,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
 
+/// An interface for killing a running process.
+/// Copied from https://github.com/tokio-rs/tokio/blob/ab8d7b82a1252b41dc072f641befb6d2afcb3373/tokio/src/process/kill.rs
+pub(crate) trait Kill {
+    /// Forcefully kills the process.
+    fn kill(&mut self) -> io::Result<()>;
+}
+
+impl<T: Kill> Kill for &mut T {
+    fn kill(&mut self) -> io::Result<()> {
+        (**self).kill()
+    }
+}
+
+/// A drop guard which can ensure the child process is killed on drop if specified.
+///
+/// From https://github.com/tokio-rs/tokio/blob/ab8d7b82a1252b41dc072f641befb6d2afcb3373/tokio/src/process/mod.rs
+#[derive(Debug)]
+struct ChildDropGuard<T: Kill> {
+    inner: T,
+    kill_on_drop: bool,
+}
+
+impl<T: Kill> Kill for ChildDropGuard<T> {
+    fn kill(&mut self) -> io::Result<()> {
+        let ret = self.inner.kill();
+
+        if ret.is_ok() {
+            self.kill_on_drop = false;
+        }
+
+        ret
+    }
+}
+
+impl<T: Kill> Drop for ChildDropGuard<T> {
+    fn drop(&mut self) {
+        if self.kill_on_drop {
+            drop(self.kill());
+        }
+    }
+}
+
+// copied from https://github.com/tokio-rs/tokio/blob/ab8d7b82a1252b41dc072f641befb6d2afcb3373/tokio/src/process/mod.rs
+impl<T, E, F> Future for ChildDropGuard<F>
+where
+    F: Future<Output = Result<T, E>> + Kill + Unpin,
+{
+    type Output = Result<T, E>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let ret = Pin::new(&mut self.inner).poll(cx);
+
+        if let Poll::Ready(Ok(_)) = ret {
+            // Avoid the overhead of trying to kill a reaped process
+            self.kill_on_drop = false;
+        }
+
+        ret
+    }
+}
+
+/// Keeps track of the exit status of a child process without worrying about
+/// polling the underlying futures even after they have completed.
+///
+/// From https://github.com/tokio-rs/tokio/blob/ab8d7b82a1252b41dc072f641befb6d2afcb3373/tokio/src/process/mod.rs
+#[derive(Debug)]
+enum FusedChild {
+    Child(ChildDropGuard<ChildProcess>),
+    Done(i32),
+}
+
 impl Child {
-    pub fn id(&self) -> i32 {
-        self.process.pid()
+    pub fn id(&self) -> Option<u32> {
+        match &self.inner {
+            FusedChild::Child(child) => Some(child.inner.pid() as u32),
+            FusedChild::Done(_) => None,
+        }
     }
 
-    pub fn wait(&mut self) -> Result<i32, std::io::Error> {
-        self.process.wait()
+    pub fn wait_blocking(&mut self) -> Result<ExitStatus, std::io::Error> {
+        drop(self.stdin.take());
+        match &mut self.inner {
+            FusedChild::Child(child) => child
+                .inner
+                .wait()
+                .map(|code| ExitStatus::from_raw(code as u32)),
+            FusedChild::Done(code) => Ok(ExitStatus::from_raw(*code as u32)),
+        }
+    }
+
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        // Ensure stdin is closed so the child isn't stuck waiting on
+        // input while the parent is waiting for it to exit.
+        drop(self.stdin.take());
+
+        match &mut self.inner {
+            FusedChild::Done(exit) => Ok(ExitStatus::from_raw(*exit as u32)),
+            FusedChild::Child(child) => {
+                let ret = child.await;
+
+                if let Ok(exit) = ret {
+                    self.inner = FusedChild::Done(exit);
+                }
+
+                ret.map(|code| ExitStatus::from_raw(code as u32))
+            }
+        }
     }
 
     pub fn try_wait(&mut self) -> Result<Option<i32>, std::io::Error> {
-        self.process.try_wait()
+        match &mut self.inner {
+            FusedChild::Done(exit) => Ok(Some(*exit)),
+            FusedChild::Child(child) => child.inner.try_wait(),
+        }
+    }
+
+    // from std
+    pub fn wait_with_output(&mut self) -> io::Result<Output> {
+        drop(self.stdin.take());
+
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        match (self.stdout.take(), self.stderr.take()) {
+            (None, None) => {}
+            (Some(mut out), None) => {
+                let res = out.read_to_end(&mut stdout);
+                res.unwrap();
+            }
+            (None, Some(mut err)) => {
+                let res = err.read_to_end(&mut stderr);
+                res.unwrap();
+            }
+            (Some(out), Some(err)) => {
+                let res = read2(
+                    unsafe { crate::anon_pipe::AnonPipe::from_raw_handle(out.into_raw_handle()) },
+                    &mut stdout,
+                    unsafe { crate::anon_pipe::AnonPipe::from_raw_handle(err.into_raw_handle()) },
+                    &mut stderr,
+                );
+                res.unwrap();
+            }
+        }
+
+        let status = self.wait_blocking()?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -69,6 +239,8 @@ pub struct Command {
     stdout: Stdio,
     stderr: Stdio,
     extra_handles: Vec<Option<HANDLE>>,
+    kill_on_drop: bool,
+    flags: u32,
 }
 
 impl Command {
@@ -84,11 +256,26 @@ impl Command {
             stdout: Stdio::Inherit,
             stderr: Stdio::Inherit,
             extra_handles: vec![],
+            kill_on_drop: false,
+            flags: 0,
         }
     }
 
-    pub fn cwd<S: AsRef<OsStr>>(&mut self, cwd: S) -> &mut Self {
-        self.cwd = Some(cwd.as_ref().to_os_string());
+    pub fn verbatim_arguments(&mut self, verbatim: bool) -> &mut Self {
+        if verbatim {
+            self.flags |= uv_process_flags::WindowsVerbatimArguments;
+        } else {
+            self.flags &= !(uv_process_flags::WindowsVerbatimArguments as u32);
+        }
+        self
+    }
+
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        self.cwd.as_deref().map(|s| Path::new(s))
+    }
+
+    pub fn current_dir<S: AsRef<Path>>(&mut self, cwd: S) -> &mut Self {
+        self.cwd = Some(cwd.as_ref().to_path_buf().into_os_string());
         self
     }
 
@@ -103,14 +290,39 @@ impl Command {
         self
     }
 
-    pub fn env<S: AsRef<OsStr>>(&mut self, key: S, value: S) -> &mut Self {
+    pub fn env<S: AsRef<OsStr>, T: AsRef<OsStr>>(&mut self, key: S, value: T) -> &mut Self {
         self.envs
             .insert(key.as_ref().to_os_string(), value.as_ref().to_os_string());
         self
     }
 
+    pub fn get_program(&self) -> &OsStr {
+        self.program.as_os_str()
+    }
+
+    pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
+        self.args.iter().map(|a| a.as_os_str())
+    }
+
+    pub fn envs<I: IntoIterator<Item = (S, T)>, S: AsRef<OsStr>, T: AsRef<OsStr>>(
+        &mut self,
+        envs: I,
+    ) -> &mut Self {
+        self.envs.extend(
+            envs.into_iter()
+                .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string())),
+        );
+        self
+    }
+
+    pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
+        self.kill_on_drop = kill_on_drop;
+        self
+    }
+
     pub fn detached(&mut self) -> &mut Self {
         self.detached = true;
+        self.kill_on_drop = false;
         self
     }
 
@@ -159,6 +371,7 @@ impl Command {
             }
             Stdio::Null => (StdioContainer::Ignore, None),
             Stdio::Inherit => (StdioContainer::InheritFd(0), None),
+            Stdio::RawHandle(handle) => (StdioContainer::RawHandle(handle), None),
         };
         let (stdout, child_stdout) = match self.stdout {
             Stdio::Pipe => {
@@ -173,6 +386,7 @@ impl Command {
             }
             Stdio::Null => (StdioContainer::Ignore, None),
             Stdio::Inherit => (StdioContainer::InheritFd(1), None),
+            Stdio::RawHandle(handle) => (StdioContainer::RawHandle(handle), None),
         };
         let (stderr, child_stderr) = match self.stderr {
             Stdio::Pipe => {
@@ -187,6 +401,7 @@ impl Command {
             }
             Stdio::Null => (StdioContainer::Ignore, None),
             Stdio::Inherit => (StdioContainer::InheritFd(2), None),
+            Stdio::RawHandle(handle) => (StdioContainer::RawHandle(handle), None),
         };
 
         let mut stdio = Vec::with_capacity(3 + self.extra_handles.len());
@@ -225,7 +440,10 @@ impl Command {
         })
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
         .map(|process| Child {
-            process,
+            inner: FusedChild::Child(ChildDropGuard {
+                inner: process,
+                kill_on_drop: self.kill_on_drop,
+            }),
             stdin: child_stdin,
             stdout: child_stdout,
             stderr: child_stderr,

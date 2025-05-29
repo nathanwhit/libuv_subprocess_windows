@@ -18,7 +18,7 @@ fn main() {
         .spawn()
         .unwrap();
 
-    eprintln!("pid: {}", child.id());
+    eprintln!("pid: {:?}", child.id());
 
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
@@ -28,9 +28,9 @@ fn main() {
     let mut buf = Vec::new();
 
     // std::thread::sleep(Duration::from_millis(5000));
-    let exit_code = child.wait().unwrap();
+    let exit_code = child.wait_blocking().unwrap();
     stdout.read_to_end(&mut buf).unwrap();
     println!("stdout: {}", String::from_utf8(buf).unwrap());
 
-    println!("exit_code: {:?}", exit_code);
+    println!("exit_code: {:?}", exit_code.code());
 }
