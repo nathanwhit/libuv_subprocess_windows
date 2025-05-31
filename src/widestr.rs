@@ -24,7 +24,7 @@ impl fmt::Debug for WCString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\"{}\"",
+            "\"{:?}\"",
             String::from_utf16_lossy(&self.buf[..self.buf.len() - 1])
         )
     }

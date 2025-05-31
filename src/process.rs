@@ -62,6 +62,7 @@ use windows_sys::{
 };
 
 use crate::{
+    env::{CommandEnv, EnvKey},
     process_stdio::{StdioContainer, free_stdio_buffer, uv_stdio_create},
     widestr::{WCStr, WCString},
 };
@@ -266,7 +267,7 @@ pub struct SpawnOptions<'a> {
     pub flags: u32,
     pub file: Cow<'a, OsStr>,
     pub args: Vec<Cow<'a, OsStr>>,
-    pub env: Option<Vec<Cow<'a, OsStr>>>,
+    pub env: &'a CommandEnv,
     pub cwd: Option<Cow<'a, OsStr>>,
     pub stdio: Vec<super::process_stdio::StdioContainer>,
 }
@@ -504,7 +505,6 @@ impl Future for ChildProcess {
 }
 
 pub fn spawn(options: &SpawnOptions) -> Result<ChildProcess, Error> {
-    let mut env: Option<WCString> = None;
     let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
     let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
 
@@ -525,13 +525,18 @@ pub fn spawn(options: &SpawnOptions) -> Result<ChildProcess, Error> {
     let arguments = make_program_args(&args, verbatim_arguments)?;
 
     // Create environment block if provided
-    if let Some(env_block) = &options.env {
-        let env_strs: Vec<&OsStr> = env_block.iter().map(|s| s.as_ref()).collect();
-        env = match make_program_env(Some(&env_strs)) {
-            Ok(env_block) => Some(env_block),
-            Err(e) => return Err(e),
-        };
-    }
+    let env_saw_path = options.env.have_changed_path();
+    let maybe_env = options.env.capture_if_changed();
+
+    let child_paths = if env_saw_path {
+        if let Some(env) = maybe_env.as_ref() {
+            env.get(&EnvKey::new("PATH")).map(|s| s.as_os_str())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Handle current working directory
     let cwd = if let Some(cwd_option) = &options.cwd {
@@ -560,18 +565,12 @@ pub fn spawn(options: &SpawnOptions) -> Result<ChildProcess, Error> {
     };
 
     // Get PATH environment variable
-    let path = if let Some(env_ref) = &env {
-        // Try to find PATH in the provided environment block
-        find_path(env_ref.as_slice_no_nul())
-    } else {
-        None
-    };
-
-    let path = path.map(|p| Some(Cow::Borrowed(p))).unwrap_or_else(|| {
-        // PATH not found in provided environment, get system PATH
-        let path = std::env::var_os("PATH")?;
-        Some(Cow::Owned(path.encode_wide().chain(Some(0)).collect()))
-    });
+    let path = child_paths
+        .map(|p| p.encode_wide().chain(Some(0)).collect::<Vec<_>>())
+        .or_else(|| {
+            // PATH not found in provided environment, get system PATH
+            std::env::var_os("PATH").map(|p| p.encode_wide().chain(Some(0)).collect::<Vec<_>>())
+        });
 
     // Create and set up stdio
     let child_stdio_buffer = uv_stdio_create(options)?;
@@ -638,11 +637,8 @@ pub fn spawn(options: &SpawnOptions) -> Result<ChildProcess, Error> {
     // Create the process
     let app_path_ptr = application_path.as_ptr();
     let args_ptr = arguments.as_ptr();
-    let env_ptr = if let Some(ref e) = env {
-        e.as_ptr()
-    } else {
-        ptr::null()
-    };
+    let (env_ptr, _data) = crate::env::make_envp(maybe_env).map_err(Error::Io)?;
+
     let cwd_ptr = cwd.as_ptr();
 
     let create_result = unsafe {
@@ -1035,169 +1031,54 @@ fn find_path(env: &[u16]) -> Option<&[u16]> {
     None
 }
 
-/// Create Windows environment block from environment variables
-///
-/// The way Windows takes environment variables is different than what C does;
-/// Windows wants a contiguous block of null-terminated strings, terminated
-/// with an additional null.
-///
-/// Windows has a few "essential" environment variables. winsock will fail
-/// to initialize if SYSTEMROOT is not defined; some APIs make reference to
-/// TEMP. SYSTEMDRIVE is probably also important. We therefore ensure that
-/// these get defined if the input environment block does not contain any
-/// values for them.
-///
-/// Also add variables known to Cygwin to be required for correct
-/// subprocess operation in many cases.
-fn make_program_env(env_block: Option<&[&OsStr]>) -> Result<WCString, Error> {
-    // If env_block is None, we'll just generate the environment with required variables
-    let env_block = env_block.unwrap_or(&[]);
-    let mut env_len = 0;
+fn get_raw(wide: *const u16) -> Vec<u16> {
+    let len = unsafe { wcslen(wide) };
+    let mut parts = Vec::<u16>::with_capacity(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(wide, parts.as_mut_ptr(), len);
+        parts.set_len(len);
+    }
+    parts
+}
 
-    // First pass: determine size in UTF-16
-    let mut env_copy = Vec::new();
-    for env in env_block {
-        if env.as_encoded_bytes().contains(&b'=') {
-            // Convert to UTF-16 and add to our collection
-            let mut utf16 = env.encode_wide().collect::<Vec<u16>>();
-            utf16.push(0); // Null terminate
-            env_len += utf16.len();
-            env_copy.push(utf16);
-        }
+fn raw_str(wide: *const u16) -> String {
+    String::from_utf16_lossy(get_raw(wide).as_slice())
+}
+
+trait RawToString {
+    fn to_string(self) -> String;
+}
+
+impl RawToString for *const u16 {
+    fn to_string(self) -> String {
+        raw_str(self)
+    }
+}
+
+pub struct FlatEnvBlock {
+    pub env_block: Vec<u16>,
+    pub env_block_count: usize,
+    pub required_vars_value_len: Vec<usize>,
+}
+
+trait GetEnvVar {
+    fn get_env_var_len(&self, name: &[u16]) -> Option<usize>;
+
+    fn get_env_var(&self, name: &[u16], value: &mut [u16]);
+}
+
+struct Real;
+impl GetEnvVar for Real {
+    fn get_env_var_len(&self, name: &[u16]) -> Option<usize> {
+        let len = unsafe { GetEnvironmentVariableW(name.as_ptr(), ptr::null_mut(), 0) };
+        if len == 0 { None } else { Some(len as usize) }
     }
 
-    // Sort the environment variables
-    env_copy.sort_by(|a, b| {
-        let cmp = qsort_wcscmp(a, b);
-        cmp.cmp(&0)
-    });
-
-    // Third pass: check for required variables
-    let mut required_vars_value_len = Vec::with_capacity(REQUIRED_VARS.len());
-    let mut required_present = vec![false; REQUIRED_VARS.len()];
-
-    for i in 0..REQUIRED_VARS.len() {
-        let mut found = false;
-        for env in &env_copy {
-            // Get a slice of wide_eq without null terminator
-            let wide_eq = REQUIRED_VARS[i].wide_eq;
-            let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
-
-            if env_strncmp(wide_eq_slice, REQUIRED_VARS[i].len as isize, env) == 0 {
-                found = true;
-                required_present[i] = true;
-                break;
-            }
-        }
-
-        if !found {
-            // Missing required var - check if it's available in the system
-            let var_size =
-                unsafe { GetEnvironmentVariableW(REQUIRED_VARS[i].wide, std::ptr::null_mut(), 0) };
-
-            required_vars_value_len.push(var_size as usize);
-
-            if var_size != 0 {
-                env_len += REQUIRED_VARS[i].len as usize;
-                env_len += var_size as usize;
-            }
-        } else {
-            required_vars_value_len.push(0);
-        }
+    fn get_env_var(&self, name: &[u16], value: &mut [u16]) {
+        unsafe {
+            GetEnvironmentVariableW(name.as_ptr(), value.as_mut_ptr(), (value.len() - 1) as u32)
+        };
     }
-
-    // Final pass: copy in sort order, inserting required variables
-    let mut result = Vec::with_capacity(env_len + 1);
-
-    // A helper to merge the sorted env_copy with required variables
-    let mut env_index = 0;
-    let mut req_index = 0;
-
-    while env_index < env_copy.len() || req_index < REQUIRED_VARS.len() {
-        if req_index >= REQUIRED_VARS.len() {
-            // No more required vars, just copy remaining environment vars
-            result.extend_from_slice(&env_copy[env_index][..]);
-            env_index += 1;
-        } else if env_index >= env_copy.len() {
-            // No more environment vars, check if we need to add this required var
-            if !required_present[req_index] && required_vars_value_len[req_index] > 0 {
-                // Add this required var
-                let var = &REQUIRED_VARS[req_index];
-
-                // Get wide_eq as a slice without null terminator
-                let wide_eq = var.wide_eq;
-                let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
-                result.extend_from_slice(wide_eq_slice);
-
-                // Get the value
-                let mut buffer = vec![0u16; required_vars_value_len[req_index]];
-                let var_size = unsafe {
-                    GetEnvironmentVariableW(var.wide, buffer.as_mut_ptr(), buffer.len() as u32)
-                };
-
-                if var_size as usize != required_vars_value_len[req_index] - 1 {
-                    uv_fatal_error("GetEnvironmentVariableW");
-                }
-
-                result.extend_from_slice(&buffer[..var_size as usize]);
-                result.push(0); // Null terminate
-            }
-            req_index += 1;
-        } else {
-            // Compare current environment var with current required var
-            // Get wide_eq as a slice without null terminator
-            let wide_eq = REQUIRED_VARS[req_index].wide_eq;
-            let wide_eq_slice = unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
-
-            let cmp = env_strncmp(
-                wide_eq_slice,
-                REQUIRED_VARS[req_index].len as isize,
-                &env_copy[env_index],
-            );
-
-            if cmp < 0 {
-                // Required var comes first alphabetically
-                if !required_present[req_index] && required_vars_value_len[req_index] > 0 {
-                    // Add this required var
-                    let var = &REQUIRED_VARS[req_index];
-
-                    // Get wide_eq as a slice without null terminator
-                    let wide_eq = var.wide_eq;
-                    let wide_eq_slice =
-                        unsafe { std::slice::from_raw_parts(wide_eq, wcslen(wide_eq)) };
-                    result.extend_from_slice(wide_eq_slice);
-
-                    // Get the value
-                    let mut buffer = vec![0u16; required_vars_value_len[req_index]];
-                    let var_size = unsafe {
-                        GetEnvironmentVariableW(var.wide, buffer.as_mut_ptr(), buffer.len() as u32)
-                    };
-
-                    if var_size as usize != required_vars_value_len[req_index] - 1 {
-                        uv_fatal_error("GetEnvironmentVariableW");
-                    }
-
-                    result.extend_from_slice(&buffer[..var_size as usize]);
-                    result.push(0); // Null terminate
-                }
-                req_index += 1;
-            } else {
-                // Environment var comes first or they are equal
-                result.extend_from_slice(&env_copy[env_index][..]);
-                env_index += 1;
-
-                if cmp == 0 {
-                    // They are equal, so we've included the required var already
-                    req_index += 1;
-                }
-            }
-        }
-    }
-
-    // Terminate with an extra NULL
-    result.push(0);
-
-    Ok(WCString::from_vec(result))
 }
 
 fn search_path(file: &[u16], cwd: &[u16], path: Option<&[u16]>, _flags: u32) -> Option<WCString> {

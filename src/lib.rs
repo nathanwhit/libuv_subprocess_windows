@@ -3,6 +3,7 @@ mod process;
 mod process_stdio;
 
 mod anon_pipe;
+mod env;
 mod widestr;
 
 use std::ffi::OsStr;
@@ -20,9 +21,9 @@ use std::task::Poll;
 
 pub use anon_pipe::handle_dup;
 use anon_pipe::read2;
+use env::CommandEnv;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::raw::HANDLE;
 use std::process::ChildStderr;
@@ -233,8 +234,7 @@ impl Child {
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
-    envs: HashMap<OsString, OsString>,
-    env_clear: bool,
+    envs: CommandEnv,
     detached: bool,
     cwd: Option<OsString>,
     stdin: Stdio,
@@ -250,8 +250,7 @@ impl Command {
         Self {
             program: program.as_ref().to_os_string(),
             args: vec![program.as_ref().to_os_string()],
-            envs: HashMap::new(),
-            env_clear: false,
+            envs: CommandEnv::default(),
             detached: false,
             cwd: None,
             stdin: Stdio::Inherit,
@@ -289,8 +288,7 @@ impl Command {
     }
 
     pub fn env<S: AsRef<OsStr>, T: AsRef<OsStr>>(&mut self, key: S, value: T) -> &mut Self {
-        self.envs
-            .insert(key.as_ref().to_os_string(), value.as_ref().to_os_string());
+        self.envs.set(key.as_ref(), value.as_ref());
         self
     }
 
@@ -306,10 +304,9 @@ impl Command {
         &mut self,
         envs: I,
     ) -> &mut Self {
-        self.envs.extend(
-            envs.into_iter()
-                .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string())),
-        );
+        for (k, v) in envs {
+            self.envs.set(k.as_ref(), v.as_ref());
+        }
         self
     }
 
@@ -325,7 +322,6 @@ impl Command {
     }
 
     pub fn env_clear(&mut self) -> &mut Self {
-        self.env_clear = true;
         self.envs.clear();
         self
     }
@@ -420,22 +416,7 @@ impl Command {
                 .iter()
                 .map(|a| Cow::Borrowed(a.as_os_str()))
                 .collect(),
-            env: if self.envs.is_empty() {
-                if self.env_clear { Some(vec![]) } else { None }
-            } else {
-                let explicit_envs = self
-                    .envs
-                    .iter()
-                    .map(|(k, v)| Cow::<OsStr>::Owned(format_env(k, v)));
-                let env: Vec<Cow<OsStr>> = if self.env_clear {
-                    explicit_envs.collect()
-                } else {
-                    explicit_envs
-                        .chain(std::env::vars_os().map(|(k, v)| Cow::Owned(format_env(&k, &v))))
-                        .collect()
-                };
-                Some(env)
-            },
+            env: &self.envs,
             cwd: self.cwd.as_deref().map(Cow::Borrowed),
             stdio,
         })
@@ -452,12 +433,4 @@ impl Command {
 
         res
     }
-}
-
-fn format_env(key: &OsStr, value: &OsStr) -> OsString {
-    let mut s = OsString::with_capacity(key.len() + value.len() + 1);
-    s.push(key);
-    s.push("=");
-    s.push(value);
-    s
 }
