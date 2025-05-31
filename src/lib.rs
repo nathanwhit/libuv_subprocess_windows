@@ -32,6 +32,8 @@ use std::process::ChildStdout;
 use crate::process::*;
 use crate::process_stdio::*;
 
+pub use process::process_kill;
+
 pub enum Stdio {
     Inherit,
     Pipe,

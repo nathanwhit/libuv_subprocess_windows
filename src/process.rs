@@ -1330,10 +1330,13 @@ const AVX_XSTATE_CONTEXT: MINIDUMP_TYPE = 0x00200000;
 /// Kill a process identified by process handle with a specific signal
 ///
 /// Returns 0 on success, or a negative error code.
-fn uv__kill(process_handle: HANDLE, signum: i32) -> Result<(), Error> {
+fn uv__kill(process_handle: HANDLE, signum: i32) -> Result<(), std::io::Error> {
     // Validate signal number
     if signum < 0 || signum >= NSIG {
-        return Err(Error::EINVAL);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid signal number",
+        ));
     }
 
     // Create a dump file for SIGQUIT
@@ -1565,17 +1568,23 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> Result<(), Error> {
                     if GetExitCodeProcess(process_handle, &mut status) != 0
                         && status != STILL_ACTIVE as u32
                     {
-                        return Err(Error::ESRCH);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Process not found",
+                        ));
                     }
 
                     // But the process could have exited with code == STILL_ACTIVE, use
                     // WaitForSingleObject with timeout zero
                     if WaitForSingleObject(process_handle, 0) == WAIT_OBJECT_0 {
-                        return Err(Error::ESRCH);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Process not found",
+                        ));
                     }
                 }
 
-                return Err(translate_sys_error(err));
+                return Err(std::io::Error::from_raw_os_error(err as i32));
             }
         }
 
@@ -1583,61 +1592,84 @@ fn uv__kill(process_handle: HANDLE, signum: i32) -> Result<(), Error> {
         0 => unsafe {
             let mut status = 0;
             if GetExitCodeProcess(process_handle, &mut status) == 0 {
-                return Err(translate_sys_error(GetLastError()));
+                return Err(std::io::Error::last_os_error());
             }
 
             if status != STILL_ACTIVE as u32 {
-                return Err(Error::ESRCH);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Process not found",
+                ));
             }
 
             match WaitForSingleObject(process_handle, 0) {
-                WAIT_OBJECT_0 => return Err(Error::ESRCH),
-                WAIT_FAILED => return Err(translate_sys_error(GetLastError())),
+                WAIT_OBJECT_0 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Process not found",
+                    ));
+                }
+                WAIT_FAILED => return Err(std::io::Error::last_os_error()),
                 WAIT_TIMEOUT => return Ok(()),
-                _ => return Err(Error::UNKNOWN),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Unknown error",
+                    ));
+                }
             }
         },
 
         // Unsupported signal
-        _ => return Err(Error::ENOSYS),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Unsupported signal",
+            ));
+        }
     }
 }
 
 /// Kill a process using its pid
-pub fn process_kill(pid: i32, signum: i32) -> Result<(), Error> {
-    let process_handle: HANDLE;
-    let result: Result<(), Error>;
-
+pub fn process_kill(pid: i32, signum: i32) -> Result<(), std::io::Error> {
     unsafe {
         // Get process handle based on pid
-        if pid == 0 {
-            process_handle = GetCurrentProcess();
+        let process_handle = if pid == 0 {
+            GetCurrentProcess()
         } else {
-            process_handle = OpenProcess(
+            OpenProcess(
                 PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
                 FALSE,
                 pid as u32,
-            );
-        }
+            )
+        };
 
         if process_handle == ptr::null_mut() {
-            let err = GetLastError();
-            if err == ERROR_INVALID_PARAMETER {
-                return Err(Error::ESRCH);
-            } else {
-                return Err(translate_sys_error(err));
-            }
+            // let err = GetLastError();
+            // if err == ERROR_INVALID_PARAMETER {
+            //     return Err(std::io::Error::new(
+            //         std::io::ErrorKind::NotFound,
+            //         "Process not found",
+            //     ));
+            // } else {
+            //     return Err(std::io::Error::new(
+            //         std::io::ErrorKind::Other,
+            //         translate_sys_error(err),
+            //     ));
+            // }
+            //
+            return Err(std::io::Error::last_os_error());
         }
 
-        result = uv__kill(process_handle, signum);
+        let result = uv__kill(process_handle, signum);
 
         // Close the handle if we opened it
         if pid != 0 {
             CloseHandle(process_handle);
         }
-    }
 
-    result
+        result
+    }
 }
 
 // /// Kill a process owned by a uv_process_t handle
