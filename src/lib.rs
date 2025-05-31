@@ -242,7 +242,7 @@ pub struct Command {
     stderr: Stdio,
     extra_handles: Vec<Option<HANDLE>>,
     kill_on_drop: bool,
-    flags: u32,
+    verbatim_arguments: bool,
 }
 
 impl Command {
@@ -259,16 +259,12 @@ impl Command {
             stderr: Stdio::Inherit,
             extra_handles: vec![],
             kill_on_drop: false,
-            flags: 0,
+            verbatim_arguments: false,
         }
     }
 
     pub fn verbatim_arguments(&mut self, verbatim: bool) -> &mut Self {
-        if verbatim {
-            self.flags |= uv_process_flags::WindowsVerbatimArguments;
-        } else {
-            self.flags &= !(uv_process_flags::WindowsVerbatimArguments as u32);
-        }
+        self.verbatim_arguments = verbatim;
         self
     }
 
@@ -303,7 +299,7 @@ impl Command {
     }
 
     pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
-        self.args.iter().map(|a| a.as_os_str())
+        self.args.iter().skip(1).map(|a| a.as_os_str())
     }
 
     pub fn envs<I: IntoIterator<Item = (S, T)>, S: AsRef<OsStr>, T: AsRef<OsStr>>(
@@ -358,6 +354,9 @@ impl Command {
         let mut flags = 0;
         if self.detached {
             flags |= uv_process_flags::Detached;
+        }
+        if self.verbatim_arguments {
+            flags |= uv_process_flags::WindowsVerbatimArguments;
         }
 
         let (stdin, child_stdin) = match self.stdin {
